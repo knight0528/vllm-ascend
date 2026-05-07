@@ -136,6 +136,40 @@ class ChunkedTokenDatabase:
             size_list.append(size)
         return addr_list, size_list
 
+    def prepare_value_from_buffer(
+        self,
+        start: int,
+        end: int,
+        block_ids: list[int],
+        buffer_base_addrs: list[int],
+    ) -> tuple[list[int], list[int]]:
+        """
+        Prepare transfer addresses using an external buffer's base address
+        instead of the registered kv_caches_base_addr. This is used by the
+        LayerwiseOffloadManager's rolling buffers.
+
+        Args:
+            start: Start token index within the block.
+            end: End token index within the block.
+            block_ids: List of block IDs allocated for the request.
+            buffer_base_addrs: Base addresses of the external buffer
+                (one per KV component, e.g., [k_base_addr, v_base_addr]
+                or [kv_base_addr] for fused format).
+
+        Returns:
+            Tuple of (addr_list, size_list) for the transfer.
+        """
+        block_id = block_ids[start // self.block_size]
+        addr_list = []
+        size_list = []
+        length = len(self.block_len)
+        for i in range(length):
+            addr = buffer_base_addrs[i % len(buffer_base_addrs)] + block_id * self.block_len[i]
+            size = int(self.block_len[i] / self.block_size * (end - start))
+            addr_list.append(addr)
+            size_list.append(size)
+        return addr_list, size_list
+
     def process_tokens(
         self,
         token_len: int,

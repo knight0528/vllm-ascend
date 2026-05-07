@@ -330,6 +330,126 @@ class KVPoolWorker:
                 raise
         self.current_layer = self.current_layer + 1
 
+    def transfer_buffer_to_pool(
+        self,
+        buffer_base_addrs: list[int],
+        layer_idx: int,
+        connector_metadata: AscendConnectorMetadata,
+        compute_event: "torch.npu.Event | None" = None,
+    ) -> None:
+        """
+        Transfer KV data from a rolling write buffer to the KV pool.
+
+        Unlike save_kv_layer which reads from the registered kv_caches,
+        this method uses the provided buffer addresses directly.
+
+        Args:
+            buffer_base_addrs: The pointers to K and V within the buffer.
+            layer_idx: The layer index being transferred.
+            connector_metadata: Metadata with request information.
+            compute_event: Optional NPU event to synchronize before transfer.
+        """
+
+        all_keys, all_addrs, all_sizes = [], [], []
+
+        for request in connector_metadata.requests:
+            can_save = request.can_save
+            if can_save is None or not can_save:
+                continue
+
+            for start, end, key in self.token_database.process_tokens(
+                request.token_len_chunk, request.block_hashes
+            ):
+                keys_multi_layer = key.split_layers(self.num_layers)
+                layer_key = keys_multi_layer[layer_idx]
+                key_str = layer_key.to_string()
+
+                addr_list, size_list = self.token_database.prepare_value_from_buffer(
+                    start, end, request.block_ids, buffer_base_addrs
+                )
+                
+                all_keys.append(key_str)
+                all_addrs.append(addr_list)
+                all_sizes.append(size_list)
+
+        if not all_keys:
+            return
+
+        # Bulk check existence to avoid redundant transfers
+        exists_results = self.m_store.exists(all_keys)
+        
+        final_keys, final_addrs, final_sizes = [], [], []
+        for i, exists in enumerate(exists_results):
+            if exists == 0:  # Not in pool
+                final_keys.append(all_keys[i])
+                final_addrs.append(all_addrs[i])
+                final_sizes.append(all_sizes[i])
+
+        if final_keys:
+            if compute_event is not None:
+                compute_event.synchronize()
+            
+            self.m_store.put(final_keys, final_addrs, final_sizes)
+            logger.debug(
+                "Batched transfer for layer %d: %d blocks",
+                layer_idx, len(final_keys)
+            )
+
+    def fetch_layer_from_pool(
+        self,
+        buffer_base_addrs: list[int],
+        layer_idx: int,
+        connector_metadata: AscendConnectorMetadata,
+    ) -> None:
+        """
+        Fetch a specific layer's KV data from the KV pool into a read buffer.
+
+        This is used during chunk prefill to retrieve previous chunks' KV
+        for the current layer.
+
+        Args:
+            buffer_base_addrs: The pointers to K and V within the buffer.
+            layer_idx: The layer index to fetch.
+            connector_metadata: Metadata with request information.
+        """
+
+        all_keys, all_addrs, all_sizes = [], [], []
+
+        for request in connector_metadata.requests:
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+
+            token_len = request.load_spec.token_len
+            mask_num = (
+                request.load_spec.vllm_cached_tokens
+                // self.block_size
+                * self.block_size
+            )
+
+            for start, end, key in self.token_database.process_tokens(
+                token_len, request.block_hashes, mask_num
+            ):
+                keys_multi_layer = key.split_layers(self.num_layers)
+                layer_key = keys_multi_layer[layer_idx]
+                key_str = layer_key.to_string()
+
+                addr_list, size_list = self.token_database.prepare_value_from_buffer(
+                    start, end, request.block_ids, buffer_base_addrs
+                )
+                
+                all_keys.append(key_str)
+                all_addrs.append(addr_list)
+                all_sizes.append(size_list)
+
+        if all_keys:
+            self.m_store.get(all_keys, all_addrs, all_sizes)
+            logger.debug(
+                "Batched fetch for layer %d: %d blocks",
+                layer_idx, len(all_keys)
+            )
+
+
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
         current_event = None
         for request in connector_metadata.requests:

@@ -85,6 +85,40 @@ class AscendStoreConnector(KVConnectorBase_V1):
 
         self.sended_but_unfinished_reqs: set[str] = set()
 
+        self.num_write_buffers = vllm_config.kv_transfer_config.kv_connector_extra_config.get("kv_offload_num_buffers", 0)
+        self.num_read_buffers = vllm_config.kv_transfer_config.kv_connector_extra_config.get("kv_offload_num_read_buffers", 2)
+        
+        self._layer_name_to_idx: dict[str, int] = {}
+        self._layer_names: list[str] = []
+        self._has_continuation_chunks = False
+        self._original_kv_caches: dict[str, torch.Tensor] = {}
+        
+        self._offload_active = (
+            self.use_layerwise
+            and self.num_write_buffers > 0
+            and self.kv_role in ["kv_producer", "kv_both"]
+            and role == KVConnectorRole.WORKER
+        )
+
+        if self._offload_active:
+            # Inline buffer state tracking
+            self._transfer_stream: torch.npu.Stream | None = None
+            self._read_stream: torch.npu.Stream | None = None
+            self._layer_to_storage_id: dict[str, int] = {}
+            
+            self._write_buffers: dict[int, list[torch.Tensor]] = {}
+            self._read_buffers: dict[int, list[torch.Tensor]] = {}
+            
+            self._write_events: dict[int, list[torch.npu.Event | None]] = {}
+            self._read_events: dict[int, list[torch.npu.Event | None]] = {}
+            self._read_consumed_events: dict[int, list[torch.npu.Event | None]] = {}
+
+            logger.info(
+                "AscendStoreConnector: offload mode ACTIVE, "
+                "num_write_buffers=%d, num_read_buffers=%d",
+                self.num_write_buffers, self.num_read_buffers
+            )
+
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = KVPoolScheduler(vllm_config, self.use_layerwise)
         else:
@@ -163,14 +197,152 @@ class AscendStoreConnector(KVConnectorBase_V1):
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
+        
+        if not self._offload_active:
+            return
+            
+        self._layer_names = sorted(kv_caches.keys())
+        self._layer_name_to_idx = {name: idx for idx, name in enumerate(self._layer_names)}
+        self._original_kv_caches = {name: tensor for name, tensor in kv_caches.items()}
+        
+        sample_cache = list(kv_caches.values())[0]
+        device = sample_cache[0].device if isinstance(sample_cache, (list, tuple)) else sample_cache.device
+        
+        self._transfer_stream = torch.npu.Stream()
+        self._read_stream = torch.npu.Stream()
+        
+        unique_storages = {}
+        for layer_name, tensor in kv_caches.items():
+            storage = tensor[0].untyped_storage() if isinstance(tensor, (list, tuple)) else tensor.untyped_storage()
+            storage_id = storage.data_ptr()
+            self._layer_to_storage_id[layer_name] = storage_id
+            
+            if storage_id not in unique_storages:
+                proto = torch.empty(storage.size(), dtype=torch.uint8, device=device)
+                proto.set_(storage)
+                unique_storages[storage_id] = proto
+
+        ptrs = []
+        lengths = []
+        for storage_id, proto in unique_storages.items():
+            w_bufs = [proto] + [torch.zeros_like(proto) for _ in range(self.num_write_buffers - 1)]
+            r_bufs = [torch.zeros_like(proto) for _ in range(self.num_read_buffers)]
+            
+            self._write_buffers[storage_id] = w_bufs
+            self._read_buffers[storage_id] = r_bufs
+            
+            self._write_events[storage_id] = [None] * self.num_write_buffers
+            self._read_events[storage_id] = [None] * self.num_read_buffers
+            self._read_consumed_events[storage_id] = [None] * self.num_read_buffers
+            
+            for buf in w_bufs + r_bufs:
+                ptrs.append(buf.data_ptr())
+                lengths.append(buf.nelement() * buf.element_size())
+
+        if hasattr(self.connector_worker, 'm_store'):
+            try:
+                self.connector_worker.m_store.register_buffer(ptrs, lengths)
+                logger.info("Registered %d offload buffers with transfer backend", len(ptrs))
+            except Exception as e:
+                logger.warning("Failed to register offload buffers with backend: %s", e)
+
+    def _check_continuation_chunks(self) -> None:
+        self._has_continuation_chunks = False
+        if not self.has_connector_metadata():
+            return
+        metadata = self._get_connector_metadata()
+        for request in metadata.requests:
+            load_spec = request.load_spec
+            if load_spec is not None and load_spec.can_load:
+                self._has_continuation_chunks = True
+                break
+
+    def _remap_layer_to_buffer(self, layer_name: str, buffer: torch.Tensor) -> None:
+        if layer_name not in self._original_kv_caches:
+            return
+        original = self._original_kv_caches[layer_name]
+        if isinstance(original, (list, tuple)):
+            for orig_tensor in original:
+                orig_tensor.set_(buffer.untyped_storage(), orig_tensor.storage_offset(), orig_tensor.shape)
+        else:
+            original.set_(buffer.untyped_storage(), original.storage_offset(), original.shape)
+
+    def _get_buffer_addrs(self, layer_name: str, buffer: torch.Tensor) -> list[int]:
+        original = self._original_kv_caches[layer_name]
+        base_ptr = buffer.data_ptr()
+        if isinstance(original, (list, tuple)):
+            return [base_ptr + orig.storage_offset() * orig.element_size() for orig in original]
+        else:
+            return [base_ptr + original.storage_offset() * original.element_size()]
+
+    def _start_next_layer_prefetch(self, next_layer_name: str, next_layer_idx: int) -> None:
+        storage_id = self._layer_to_storage_id.get(next_layer_name)
+        if storage_id is None:
+            return
+            
+        r_idx = next_layer_idx % self.num_read_buffers
+        if self.num_read_buffers <= 0:
+            return
+            
+        read_buf = self._read_buffers[storage_id][r_idx]
+        
+        consume_event = self._read_consumed_events[storage_id][r_idx]
+        if consume_event is not None:
+            self._read_stream.wait_event(consume_event)
+            
+        if hasattr(self.connector_worker, "fetch_layer_from_pool"):
+            buffer_addrs = self._get_buffer_addrs(next_layer_name, read_buf)
+            with torch.npu.stream(self._read_stream):
+                self.connector_worker.fetch_layer_from_pool(
+                    buffer_base_addrs=buffer_addrs, layer_idx=next_layer_idx, connector_metadata=self._get_connector_metadata()
+                )
+                fetch_ev = torch.npu.Event()
+                fetch_ev.record(self._read_stream)
+                self._read_events[storage_id][r_idx] = fetch_ev
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
+        if self._offload_active:
+            self._check_continuation_chunks()
+            if self._has_continuation_chunks and len(self._layer_names) > 0:
+                for i in range(min(self.num_read_buffers, len(self._layer_names))):
+                    self._start_next_layer_prefetch(self._layer_names[i], i)
+                    
         self.connector_worker.start_load_kv(self._get_connector_metadata())
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
+        if self._offload_active:
+            layer_idx = self._layer_name_to_idx.get(layer_name, -1)
+            if layer_idx < 0:
+                return
+                
+            storage_id = self._layer_to_storage_id[layer_name]
+            w_idx = layer_idx % self.num_write_buffers
+            write_buf = self._write_buffers[storage_id][w_idx]
+            
+            # Wait for previous transfer
+            if self._write_events[storage_id][w_idx] is not None:
+                self._write_events[storage_id][w_idx].synchronize()
+                
+            if self._has_continuation_chunks and self.num_read_buffers > 0:
+                r_idx = layer_idx % self.num_read_buffers
+                read_buf = self._read_buffers[storage_id][r_idx]
+                
+                # Wait for prefetch
+                if self._read_events[storage_id][r_idx] is not None:
+                    self._read_events[storage_id][r_idx].synchronize()
+                    
+                write_buf.copy_(read_buf, non_blocking=True)
+                
+                consume_ev = torch.npu.Event()
+                consume_ev.record()
+                self._read_consumed_events[storage_id][r_idx] = consume_ev
+                
+            self._remap_layer_to_buffer(layer_name, write_buf)
+            return
+            
         self.connector_worker.wait_for_layer_load()
 
     def save_kv_layer(
@@ -182,6 +354,39 @@ class AscendStoreConnector(KVConnectorBase_V1):
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
+        if self._offload_active:
+            layer_idx = self._layer_name_to_idx.get(layer_name, -1)
+            if layer_idx < 0:
+                return
+                
+            storage_id = self._layer_to_storage_id[layer_name]
+            w_idx = layer_idx % self.num_write_buffers
+            write_buf = self._write_buffers[storage_id][w_idx]
+            
+            compute_ev = torch.npu.Event()
+            compute_ev.record()
+            self._transfer_stream.wait_event(compute_ev)
+            
+            with torch.npu.stream(self._transfer_stream):
+                if hasattr(self.connector_worker, "transfer_buffer_to_pool"):
+                    buffer_addrs = self._get_buffer_addrs(layer_name, write_buf)
+                    self.connector_worker.transfer_buffer_to_pool(
+                        buffer_base_addrs=buffer_addrs, layer_idx=layer_idx, 
+                        connector_metadata=self._get_connector_metadata(), compute_event=compute_ev
+                    )
+                else:
+                    self.connector_worker.save_kv_layer(self._get_connector_metadata())
+                    
+                transfer_ev = torch.npu.Event()
+                transfer_ev.record(self._transfer_stream)
+                self._write_events[storage_id][w_idx] = transfer_ev
+                
+            if self._has_continuation_chunks and self.num_read_buffers > 0:
+                next_idx = layer_idx + self.num_read_buffers
+                if next_idx < len(self._layer_names):
+                    self._start_next_layer_prefetch(self._layer_names[next_idx], next_idx)
+            return
+            
         self.connector_worker.save_kv_layer(self._get_connector_metadata())
 
     def wait_for_save(self):
@@ -190,6 +395,11 @@ class AscendStoreConnector(KVConnectorBase_V1):
             return
 
         if self.use_layerwise:
+            if self._offload_active:
+                for events in self._write_events.values():
+                    for ev in events:
+                        if ev is not None:
+                            ev.synchronize()
             return
 
         self.connector_worker.wait_for_save(self._get_connector_metadata())
@@ -213,6 +423,8 @@ class AscendStoreConnector(KVConnectorBase_V1):
         ascend_store_kv_events = AscendStoreKVEvents(num_workers=1)
         ascend_store_kv_events.add_events(events)
         return ascend_store_kv_events
+
+
 
 
 class LookupKeyServer:
