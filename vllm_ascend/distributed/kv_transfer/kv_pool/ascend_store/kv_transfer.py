@@ -305,6 +305,32 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
+        # Counter-based buffer sync for k-layer buffering (set by pool_worker)
+        self.buffer_pending_counts: list[int] | None = None
+        self.buffer_condition: threading.Condition | None = None
+
+    def _get_buffer_idx(self, layer_id: int) -> int:
+        """Get the physical buffer index for a given layer using explicit mapping."""
+        if self.token_database.layer_to_buffer_map:
+            if layer_id not in self.token_database.layer_to_buffer_map:
+                raise KeyError(
+                    f"K-layer buffering: layer {layer_id} not found in layer_to_buffer_map. "
+                    f"Available layers: {list(self.token_database.layer_to_buffer_map.keys())}."
+                )
+            return self.token_database.layer_to_buffer_map[layer_id]
+        return layer_id % len(self.buffer_pending_counts) if self.buffer_pending_counts else layer_id
+
+    def _notify_buffer_available(self, layer_id: int):
+        """Decrement pending count for the physical buffer; wake waiters when it hits 0."""
+        if self.buffer_condition is None or self.buffer_pending_counts is None:
+            return
+        if len(self.buffer_pending_counts) == 0:
+            return
+        buf_idx = self._get_buffer_idx(layer_id)
+        with self.buffer_condition:
+            self.buffer_pending_counts[buf_idx] -= 1
+            if self.buffer_pending_counts[buf_idx] == 0:
+                self.buffer_condition.notify_all()
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
@@ -329,6 +355,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if not keys:
             if is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
+            self._notify_buffer_available(layer_id)
+            self.request_queue.task_done()
             return
 
         key_list = []
@@ -341,36 +369,42 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if not missing_indices:
             if is_last_chunk and layer_id == self.final_layer_id:
                 self.set_finished_request(req_meta.req_id)
+            self._notify_buffer_available(layer_id)
+            self.request_queue.task_done()
             return
 
         starts = [starts[index] for index in missing_indices]
         ends = [ends[index] for index in missing_indices]
         key_list = [key_list[index] for index in missing_indices]
 
-        addr_list = []
-        size_list = []
-        for index, key in enumerate(key_list):
-            addr, size = self.token_database.prepare_value_layer(
-                starts[index], ends[index], req_meta.block_ids, layer_id
+        try:
+            addr_list = []
+            size_list = []
+            for index, key in enumerate(key_list):
+                addr, size = self.token_database.prepare_value_layer(
+                    starts[index], ends[index], req_meta.block_ids, layer_id
+                )
+                addr_list.append(addr)
+                size_list.append(size)
+
+            if current_event is not None:
+                current_event.synchronize()
+            self.m_store.put(key_list, addr_list, size_list)
+
+            if layer_id == self.final_layer_id and is_last_chunk:
+                self.set_finished_request(req_meta.req_id)
+
+            logger.info(
+                "Storing KV cache for %d out of %d blocks (skip_block_num=%d) for request %s",
+                len(keys),
+                total_block,
+                skip_block_num,
+                req_meta.req_id,
             )
-            addr_list.append(addr)
-            size_list.append(size)
-
-        if current_event is not None:
-            current_event.synchronize()
-        self.m_store.put(key_list, addr_list, size_list)
-
-        if layer_id == self.final_layer_id and is_last_chunk:
-            self.set_finished_request(req_meta.req_id)
-        self.request_queue.task_done()
-
-        logger.info(
-            "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s",
-            len(key_list),
-            total_block,
-            len(missing_indices),
-            req_meta.req_id,
-        )
+        finally:
+            # Always notify buffer available to prevent deadlock
+            self._notify_buffer_available(layer_id)
+            self.request_queue.task_done()
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):

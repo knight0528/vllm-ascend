@@ -98,6 +98,13 @@ class ChunkedTokenDatabase:
         self.kv_caches_base_addr: list[int] = []
         self.block_len: list[int] = []
         self.partitions = partitions
+        self.num_kv_buffer_layers: int | None = None
+        # Explicit layer mapping: logical_layer_id -> physical_buffer_index
+        # For K-layer buffering: layer k..N-1 map to buffers 0..k-1
+        self.layer_to_buffer_map: dict[int, int] = {}
+        # Physical buffer base addresses: physical_layer_id -> [k_addr, v_addr, ...]
+        # This is populated by set_physical_buffer_addrs() for explicit mapping
+        self._physical_buffer_addrs: dict[int, list[int]] = {}
 
     def _make_key_by_hash(self, chunk_hash: str, layer_id: int | None = None):
         assert self.metadata is not None
@@ -111,6 +118,31 @@ class ChunkedTokenDatabase:
 
     def set_block_len(self, block_len: list[int]):
         self.block_len = block_len
+
+    def set_num_kv_buffer_layers(self, n: int, num_layers: int | None = None):
+        """Set the number of physical KV buffer layers for K-layer buffering.
+
+        Args:
+            n: Number of physical buffer layers. If n <= 0 or n >= num_layers,
+               K-layer buffering is disabled.
+            num_layers: Total number of logical layers. Required when n > 0.
+        """
+        self.num_kv_buffer_layers = n
+        self.layer_to_buffer_map = {}
+
+        # Build explicit layer mapping for K-layer buffering
+        if n is not None and n > 0 and num_layers is not None and n < num_layers:
+            for logical_layer in range(num_layers):
+                self.layer_to_buffer_map[logical_layer] = logical_layer % n
+
+    def set_physical_buffer_addrs(self, addrs: dict[int, list[int]]):
+        """Set physical buffer base addresses explicitly.
+
+        Args:
+            addrs: Mapping from physical_layer_id to list of base addresses
+                   (e.g., {0: [k0_addr, v0_addr], 1: [k1_addr, v1_addr], ...})
+        """
+        self._physical_buffer_addrs = addrs
 
     def prepare_value(self, start: int, end: int, block_ids: list[int]):
         addr_list = []
@@ -126,14 +158,20 @@ class ChunkedTokenDatabase:
 
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
-        addr_list = []
-        size_list = []
         length = len(self.block_len)
-        for i in range(length):
-            addr = self.kv_caches_base_addr[layer_id * length] + block_id * self.block_len[i]
-            size = int(self.block_len[i] / self.block_size * (end - start))
-            addr_list.append(addr)
-            size_list.append(size)
+
+        # Resolve physical layer for K-layer buffering
+        physical_layer = self.layer_to_buffer_map[layer_id] if self.layer_to_buffer_map else layer_id
+
+        # Get base addresses: explicit mapping or legacy indexing
+        if self._physical_buffer_addrs:
+            base_addrs = self._physical_buffer_addrs[physical_layer]
+        else:
+            offset = physical_layer * length
+            base_addrs = self.kv_caches_base_addr[offset:offset + length]
+
+        addr_list = [base_addrs[i] + block_id * self.block_len[i] for i in range(length)]
+        size_list = [int(self.block_len[i] / self.block_size * (end - start)) for i in range(length)]
         return addr_list, size_list
 
     def process_tokens(

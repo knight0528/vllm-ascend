@@ -101,6 +101,15 @@ class KVPoolScheduler:
         )
 
         if need_to_allocate <= 0:
+            # K-layer buffering: when buffer is reused, need to reload previous chunks' KV
+            if (self.use_layerwise and num_computed_tokens > 0
+                    and num_external_hit_tokens >= num_computed_tokens):
+                self.load_specs[request.request_id] = LoadSpec(
+                    vllm_cached_tokens=0,
+                    kvpool_cached_tokens=num_computed_tokens,
+                    can_load=True,
+                )
+                return 0, True
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
@@ -129,8 +138,12 @@ class KVPoolScheduler:
             return
 
         if num_external_tokens == 0:
-            # No need to load anything
-            self.load_specs[request.request_id].can_load = False
+            # K-layer buffering: keep can_load=True if we need to reload previous chunks
+            # This happens when buffer is reused and we need to load previously computed KV
+            if self.use_layerwise and self.load_specs[request.request_id].kvpool_cached_tokens > 0:
+                pass  # Keep can_load=True as set in get_num_new_matched_tokens
+            else:
+                self.load_specs[request.request_id].can_load = False
             return
 
         assert (
@@ -272,6 +285,29 @@ class KVPoolScheduler:
                         continue
                     request_tracker.update(new_block_ids)
 
+                    # K-layer buffering: need to load previous chunks' KV from KVPool
+                    load_spec = None
+                    if (self.use_layerwise and num_computed_token > 0
+                            and request.block_hashes):
+                        # Lookup how many tokens are cached in KVPool
+                        if self._discard_partial_chunks:
+                            token_len = len(request.prompt_token_ids) // self._block_size * self._block_size
+                        else:
+                            token_len = len(request.prompt_token_ids)
+                        num_kvpool_hit = self.client.lookup(token_len, request.block_hashes)
+                        if num_kvpool_hit >= num_computed_token:
+                            load_spec = LoadSpec(
+                                vllm_cached_tokens=0,
+                                kvpool_cached_tokens=num_computed_token,
+                                can_load=True,
+                            )
+                            logger.info(
+                                "K-layer buffering: chunk %d+ loading %d tokens from KVPool for request %s",
+                                num_computed_token // scheduler_output.num_scheduled_tokens.get(req_id, 1) + 1,
+                                num_computed_token,
+                                req_id,
+                            )
+
                     last_chunk_tokens_num = (
                         (len(request.prompt_token_ids) // self._block_size * self._block_size)
                         if self._discard_partial_chunks
@@ -280,7 +316,7 @@ class KVPoolScheduler:
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
                         self._block_size,
-                        load_spec=None,
+                        load_spec=load_spec,
                         skip_save=force_skip_save,
                         block_hashes=request.block_hashes,
                         is_last_chunk=request_tracker.token_len >= last_chunk_tokens_num,
