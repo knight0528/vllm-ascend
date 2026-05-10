@@ -186,29 +186,22 @@ class KVPoolWorker:
         self.finished_store_req: set[str] = set()
 
     def is_klayer_buffering_enabled(self) -> bool:
-        """Check if K-layer buffering is enabled and properly configured."""
         return (
             self.num_kv_buffer_layers > 0
             and self.num_kv_buffer_layers < self.num_layers
         )
 
     def get_buffer_idx(self, layer_id: int) -> int:
-        """Get the physical buffer index for a given layer."""
         if self.token_database.layer_to_buffer_map:
-            return self.token_database.layer_to_buffer_map[layer_id]
+            return self.token_database.layer_to_buffer_map.get(
+                layer_id, layer_id % self.num_kv_buffer_layers
+            )
         return layer_id % self.num_kv_buffer_layers
 
     def _check_buffer_sync_enabled(self) -> bool:
-        """Check if buffer sync is properly initialized."""
         return self.is_klayer_buffering_enabled() and self.buffer_condition is not None
 
     def _load_layer_kv(self, connector_metadata: AscendConnectorMetadata, layer_id: int) -> None:
-        """Load a single layer's KV from KVPool for K-layer buffering.
-
-        In K-layer buffering mode, local buffers are reused by multiple layers.
-        This method loads only the current layer's KV to avoid overwriting other layers.
-        Must be called AFTER waiting for buffer availability (for layer >= num_kv_buffer_layers).
-        """
         for request in connector_metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:
@@ -241,17 +234,10 @@ class KVPoolWorker:
                     layer_id, len(keys), request.req_id
                 )
 
-            # Mark as fully loaded after processing the last layer
             if layer_id == self.num_layers - 1:
                 load_spec.can_load = False
 
     def acquire_buffer(self, layer_id: int, count: int = 1) -> None:
-        """Atomically wait for buffer and acquire it (increment pending count).
-
-        Args:
-            layer_id: Layer ID to get buffer index
-            count: Number of pending operations to register (default 1)
-        """
         if not self._check_buffer_sync_enabled():
             return
         buf_idx = self.get_buffer_idx(layer_id)
@@ -387,21 +373,18 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers = []
-        # Cache connector_metadata for use in wait_for_layer_load (K-layer buffering)
         self._cached_connector_metadata = metadata
 
         # For K-layer buffering: wait for all pending sends from previous chunk
-        # before starting a new forward pass
         if self.is_klayer_buffering_enabled() and self.buffer_pending_counts is not None:
             with self.buffer_condition:
                 for buf_idx in range(self.num_kv_buffer_layers):
                     while self.buffer_pending_counts[buf_idx] > 0:
                         self.buffer_condition.wait()
-            logger.debug("All pending KV sends completed before new chunk")
 
         for request in metadata.requests:
             load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:  # load =0
+            if load_spec is None or not load_spec.can_load:
                 continue
             token_len = request.token_len_chunk
             if (load_spec.kvpool_cached_tokens % self.block_size != 0) and (
@@ -411,9 +394,13 @@ class KVPoolWorker:
             else:
                 token_len = request.load_spec.kvpool_cached_tokens
             request.load_spec.token_len = token_len
-            if self.use_layerwise:
+            if self.is_klayer_buffering_enabled():
+                # K-buffer: loading happens per-layer in wait_for_layer_load
+                # via _load_layer_kv_before_attention -> _load_layer_kv
+                continue
+            elif self.use_layerwise:
                 layerwise_retriever = self.retrieve_layer(request)
-                next(layerwise_retriever)  # first layer load
+                next(layerwise_retriever)
                 self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 if self.load_async:
@@ -441,42 +428,32 @@ class KVPoolWorker:
                     )
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
 
-    def wait_for_layer_load(self) -> None:
-        # K-layer buffering: load previous chunks' KV from KVPool before attention computation
-        # This must happen BEFORE attention reads from the buffer
+    def wait_for_layer_load(self, layer_name: str = "") -> None:
         if self.is_klayer_buffering_enabled() and self._cached_connector_metadata is not None:
-            self._load_layer_kv_before_attention()
+            layer_id = extract_layer_index(layer_name) if layer_name else self.current_layer
+            if layer_id < self.num_layers:
+                self._load_layer_kv_before_attention(layer_id)
 
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.debug("Retrieved %s tokens", num_retrieved_tokens)
+                logger.debug(f"Retrieved {num_retrieved_tokens} tokens")
 
-        # Increment layer counter after loading (for next layer)
         self.current_layer = self.current_layer + 1
 
-    def _load_layer_kv_before_attention(self) -> None:
-        """Load a single layer's KV from KVPool before attention computes.
-
-        This is called from wait_for_layer_load, which is invoked BEFORE attention.
-        Must wait for buffer availability (for layer >= num_kv_buffer_layers) before loading.
-        """
-        layer_id = self.current_layer
-        connector_metadata = self._cached_connector_metadata
-
-        # Wait for buffer availability before loading (for layers that reuse buffers)
+    def _load_layer_kv_before_attention(self, layer_id: int) -> None:
         if layer_id >= self.num_kv_buffer_layers:
-            self.acquire_buffer(layer_id, count=len(connector_metadata.requests) if connector_metadata else 1)
+            self.acquire_buffer(layer_id, count=len(self.layerwise_storers))
+        self._load_layer_kv(self._cached_connector_metadata, layer_id)
 
-        # Load this layer's KV from KVPool
-        self._load_layer_kv(connector_metadata, layer_id)
-
-    def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
-        # Note: current_layer is already incremented in wait_for_layer_load
-        # so the actual layer being saved is current_layer - 1
-        layer_idx = self.current_layer - 1 if self.current_layer > 0 else 0
+    def save_kv_layer(
+        self, connector_metadata: AscendConnectorMetadata, layer_name: str = ""
+    ) -> None:
+        layer_idx = extract_layer_index(layer_name) if layer_name else self.current_layer - 1 if self.current_layer > 0 else 0
+        if layer_idx >= self.num_layers:
+            return
 
         if layer_idx == 0:
             self.layerwise_storers = []
@@ -495,7 +472,6 @@ class KVPoolWorker:
 
                 layerwise_storer = self.store_layer(request, current_event)
                 self.layerwise_storers.append(layerwise_storer)
-            # Initialize counter-based buffer sync for k-layer buffering
             if self.is_klayer_buffering_enabled():
                 self.buffer_pending_counts = [0] * self.num_kv_buffer_layers
                 self.buffer_condition = threading.Condition()
@@ -503,8 +479,7 @@ class KVPoolWorker:
                     self.kv_send_thread.buffer_pending_counts = self.buffer_pending_counts
                     self.kv_send_thread.buffer_condition = self.buffer_condition
 
-        # Wait for buffer availability before writing (for layers that reuse buffers)
-        if self.is_klayer_buffering_enabled() and layer_idx >= self.num_kv_buffer_layers:
+        if self.is_klayer_buffering_enabled() and layer_idx < self.num_kv_buffer_layers:
             self.acquire_buffer(layer_idx, count=len(self.layerwise_storers))
 
         for layerwise_storer in self.layerwise_storers:
@@ -687,6 +662,12 @@ class KVPoolWorker:
         return done_sending, done_recving
 
     def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
+        if self.use_layerwise:
+            # Layerwise path: KVCacheStoreLayerSendingThread uses the base class
+            # finished_requests set (set_finished_request in _handle_request).
+            return self.kv_send_thread.get_and_clear_finished_requests()  # type: ignore[union-attr]
+
+        # Non-layerwise path: uses stored_requests counter on KVCacheStoreSendingThread
         finished_sending = set()
         for req_id in meta.preempted_req_ids:
             self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]

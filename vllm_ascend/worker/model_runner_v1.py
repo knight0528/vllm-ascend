@@ -3223,10 +3223,6 @@ class NPUModelRunner(GPUModelRunner):
                     current_kv_cache_spec = layer_kv_cache_spec[layer_name]
                     assert isinstance(current_kv_cache_spec, AttentionSpec)
 
-                    # K-layer buffering: get layer index and check for buffer reuse
-                    layer_idx = extract_layer_index(layer_name)
-                    buffer_idx = layer_idx % num_kv_buffer_layers if num_kv_buffer_layers > 0 else layer_idx
-
                     if self.use_sparse:
                         # for deepseek v3.2, we split the kv cache according to the corresponding ratio
                         kv_cache_spec = layer_kv_cache_spec[layer_name]
@@ -3260,39 +3256,6 @@ class NPUModelRunner(GPUModelRunner):
                     if self.use_sparse and current_sparse_c8:
                         dsa_k_scale_tensor_size = int(kv_cache_tensor.size // dsa_k_scale_tensor_split_factor)
 
-                    # Cache signature for safe buffer reuse validation (K-layer buffering)
-                    cache_signature = (
-                        kv_cache_tensor.size,
-                        k_tensor_size,
-                        v_tensor_size,
-                        bool(self.use_sparse),
-                        dsa_k_tensor_size,
-                        dsa_k_scale_tensor_size,
-                        current_sparse_c8 if self.use_sparse else None,
-                    )
-
-                    # Check if we can reuse an existing buffer (K-layer buffering)
-                    # Note: shared_by contains layers with the same layer_idx (different attention groups),
-                    # so they should all share the same physical buffer for K-layer buffering.
-                    if num_kv_buffer_layers > 0 and layer_idx >= num_kv_buffer_layers and buffer_idx in kv_buffer_pool:
-                        stored_buffer, stored_signature = kv_buffer_pool[buffer_idx]
-                        if stored_signature != cache_signature:
-                            raise ValueError(
-                                f"K-layer buffering: layer {layer_idx} cache signature mismatch. "
-                                f"Expected {cache_signature} but buffer {buffer_idx} has {stored_signature}. "
-                                f"K-layer buffering requires all layers to have identical KV cache structure "
-                                f"(size, K/V split, sparse mode). This can happen with models that have "
-                                f"different attention configurations per layer."
-                            )
-                        for layer_name_inner in kv_cache_tensor.shared_by:
-                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                                kv_cache_raw_tensors[layer_name_inner] = stored_buffer
-                        logger.debug(
-                            "K-layer buffering: layer %d reusing buffer %d for %s",
-                            layer_idx, buffer_idx, layer_name
-                        )
-                        continue
-
                     # for other attentions, e.g., self_attn, sliding window attn
                     if self.vllm_config.kv_transfer_config is None:
                         k_tensor = torch.zeros(k_tensor_size, dtype=torch.int8, device=self.device)
@@ -3323,27 +3286,66 @@ class NPUModelRunner(GPUModelRunner):
                                 dsa_k_scale_tensor, alignment
                             )[:dsa_k_scale_tensor_size]
 
-                    # Create the buffer tuple
-                    if self.use_sparse:
-                        if dsa_k_scale_tensor_size is not None:
-                            buffer_tuple = (k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor)
-                        else:
-                            buffer_tuple = (k_tensor, v_tensor, dsa_k_tensor)
-                    else:
-                        buffer_tuple = (k_tensor, v_tensor)
-
-                    # Store in buffer pool if K-layer buffering is enabled
                     if num_kv_buffer_layers > 0:
+                        layer_idx = extract_layer_index(layer_name)
+                        buffer_idx = layer_idx % num_kv_buffer_layers
+                        cache_signature = (
+                            kv_cache_tensor.size,
+                            k_tensor_size,
+                            v_tensor_size,
+                            bool(self.use_sparse),
+                            dsa_k_tensor_size,
+                            dsa_k_scale_tensor_size,
+                            current_sparse_c8 if self.use_sparse else None,
+                        )
+                        if layer_idx >= num_kv_buffer_layers and buffer_idx in kv_buffer_pool:
+                            stored_buffer, stored_signature = kv_buffer_pool[buffer_idx]
+                            if stored_signature != cache_signature:
+                                raise ValueError(
+                                    f"K-layer buffering: layer {layer_idx} cache signature mismatch. "
+                                    f"Expected {cache_signature} but buffer {buffer_idx} has {stored_signature}. "
+                                    f"K-layer buffering requires all layers to have identical KV cache structure "
+                                    f"(size, K/V split, sparse mode). This can happen with models that have "
+                                    f"different attention configurations per layer."
+                                )
+                            for layer_name_inner in kv_cache_tensor.shared_by:
+                                if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                                    kv_cache_raw_tensors[layer_name_inner] = stored_buffer
+                            logger.debug(
+                                "K-layer buffering: layer %d reusing buffer %d for %s",
+                                layer_idx, buffer_idx, layer_name
+                            )
+                            continue
+                        if self.use_sparse:
+                            if dsa_k_scale_tensor_size is not None:
+                                buffer_tuple = (k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor)
+                            else:
+                                buffer_tuple = (k_tensor, v_tensor, dsa_k_tensor)
+                        else:
+                            buffer_tuple = (k_tensor, v_tensor)
                         kv_buffer_pool[buffer_idx] = (buffer_tuple, cache_signature)
                         logger.debug(
                             "K-layer buffering: allocated buffer %d for layer %d (%s, signature=%s)",
                             buffer_idx, layer_idx, layer_name, cache_signature
                         )
-
-                    for layer_name_inner in kv_cache_tensor.shared_by:
-                        # shared the attn kvcache for all shared layers
-                        if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
-                            kv_cache_raw_tensors[layer_name_inner] = buffer_tuple
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                                kv_cache_raw_tensors[layer_name_inner] = buffer_tuple
+                    else:
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            # shared the attn kvcache for all shared layers
+                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                                if self.use_sparse:
+                                    if current_sparse_c8:
+                                        kv_cache_raw_tensors[layer_name_inner] = (
+                                            k_tensor, v_tensor, dsa_k_tensor, dsa_k_scale_tensor
+                                        )
+                                    else:
+                                        kv_cache_raw_tensors[layer_name_inner] = (
+                                            k_tensor, v_tensor, dsa_k_tensor
+                                        )
+                                else:
+                                    kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
 
         layer_names = set()
         for group in kv_cache_config.kv_cache_groups:
