@@ -322,9 +322,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
     def _notify_buffer_available(self, layer_id: int):
         """Decrement pending count for the physical buffer; wake waiters when it hits 0."""
-        if self.buffer_condition is None or self.buffer_pending_counts is None:
-            return
-        if len(self.buffer_pending_counts) == 0:
+        if self.buffer_condition is None:
             return
         buf_idx = self._get_buffer_idx(layer_id)
         with self.buffer_condition:
@@ -376,6 +374,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         starts = [starts[index] for index in missing_indices]
         ends = [ends[index] for index in missing_indices]
         key_list = [key_list[index] for index in missing_indices]
+        skip_block_num = total_block - len(key_list)
 
         try:
             addr_list = []
@@ -396,7 +395,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
             logger.info(
                 "Storing KV cache for %d out of %d blocks (skip_block_num=%d) for request %s",
-                len(keys),
+                len(key_list),
                 total_block,
                 skip_block_num,
                 req_meta.req_id,
