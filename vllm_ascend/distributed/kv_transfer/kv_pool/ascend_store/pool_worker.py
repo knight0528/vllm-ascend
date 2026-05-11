@@ -193,7 +193,9 @@ class KVPoolWorker:
 
     def get_buffer_idx(self, layer_id: int) -> int:
         if self.token_database.layer_to_buffer_map:
-            return self.token_database.layer_to_buffer_map[layer_id]
+            return self.token_database.layer_to_buffer_map.get(
+                layer_id, layer_id % self.num_kv_buffer_layers
+            )
         return layer_id % self.num_kv_buffer_layers
 
     def _check_buffer_sync_enabled(self) -> bool:
@@ -392,7 +394,11 @@ class KVPoolWorker:
             else:
                 token_len = request.load_spec.kvpool_cached_tokens
             request.load_spec.token_len = token_len
-            if self.use_layerwise and not self.is_klayer_buffering_enabled():
+            if self.is_klayer_buffering_enabled():
+                # K-buffer: loading happens per-layer in wait_for_layer_load
+                # via _load_layer_kv_before_attention -> _load_layer_kv
+                continue
+            elif self.use_layerwise:
                 layerwise_retriever = self.retrieve_layer(request)
                 next(layerwise_retriever)
                 self.layerwise_retrievers.append(layerwise_retriever)
@@ -422,9 +428,11 @@ class KVPoolWorker:
                     )
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
 
-    def wait_for_layer_load(self) -> None:
+    def wait_for_layer_load(self, layer_name: str = "") -> None:
         if self.is_klayer_buffering_enabled() and self._cached_connector_metadata is not None:
-            self._load_layer_kv_before_attention()
+            layer_id = extract_layer_index(layer_name) if layer_name else self.current_layer
+            if layer_id < self.num_layers:
+                self._load_layer_kv_before_attention(layer_id)
 
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
@@ -435,14 +443,17 @@ class KVPoolWorker:
 
         self.current_layer = self.current_layer + 1
 
-    def _load_layer_kv_before_attention(self) -> None:
-        layer_id = self.current_layer
+    def _load_layer_kv_before_attention(self, layer_id: int) -> None:
         if layer_id >= self.num_kv_buffer_layers:
             self.acquire_buffer(layer_id, count=len(self.layerwise_storers))
         self._load_layer_kv(self._cached_connector_metadata, layer_id)
 
-    def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
-        layer_idx = self.current_layer - 1 if self.current_layer > 0 else 0
+    def save_kv_layer(
+        self, connector_metadata: AscendConnectorMetadata, layer_name: str = ""
+    ) -> None:
+        layer_idx = extract_layer_index(layer_name) if layer_name else self.current_layer - 1 if self.current_layer > 0 else 0
+        if layer_idx >= self.num_layers:
+            return
 
         if layer_idx == 0:
             self.layerwise_storers = []
@@ -651,6 +662,12 @@ class KVPoolWorker:
         return done_sending, done_recving
 
     def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
+        if self.use_layerwise:
+            # Layerwise path: KVCacheStoreLayerSendingThread uses the base class
+            # finished_requests set (set_finished_request in _handle_request).
+            return self.kv_send_thread.get_and_clear_finished_requests()  # type: ignore[union-attr]
+
+        # Non-layerwise path: uses stored_requests counter on KVCacheStoreSendingThread
         finished_sending = set()
         for req_id in meta.preempted_req_ids:
             self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
