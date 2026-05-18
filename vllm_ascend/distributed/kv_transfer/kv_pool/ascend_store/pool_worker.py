@@ -470,12 +470,10 @@ class KVPoolWorker:
                     while self.buffer_pending_counts[buf_idx] > 0:
                         self.buffer_condition.wait()
 
-        # Late lookup: scheduler may have missed blocks whose async sends
-        # from the previous chunk just completed. Re-check and fix load_spec.
+        # Late lookup: scheduler may have set load_spec before async sends
+        # from the previous chunk completed. Re-verify actual pool contents.
         if self.is_klayer_buffering_enabled():
             for request in metadata.requests:
-                if request.load_spec is not None and request.load_spec.can_load:
-                    continue
                 if not request.block_hashes:
                     continue
                 start_indices = []
@@ -504,6 +502,12 @@ class KVPoolWorker:
                     logger.debug(
                         "Late lookup: request %s found %d tokens in pool",
                         request.req_id, kvpool_cached,
+                    )
+                else:
+                    request.load_spec = None
+                    logger.debug(
+                        "Late lookup: request %s no tokens in pool, cleared load_spec",
+                        request.req_id,
                     )
 
         # Recompute after late lookup may have set new load specs

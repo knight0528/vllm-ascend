@@ -101,9 +101,10 @@ class KVPoolScheduler:
         )
 
         if need_to_allocate <= 0:
-            # K-layer buffering: when buffer is reused, need to reload previous chunks' KV
-            if (self.use_layerwise and num_computed_tokens > 0
-                    and num_external_hit_tokens >= num_computed_tokens):
+            # K-layer buffering: when buffer is reused, need to reload previous chunks' KV.
+            # Async sends from previous chunk may not be visible to this lookup yet,
+            # so always set load_spec. start_load_kv will verify and correct if needed.
+            if self.use_layerwise and num_computed_tokens > 0:
                 self.load_specs[request.request_id] = LoadSpec(
                     vllm_cached_tokens=0,
                     kvpool_cached_tokens=num_computed_tokens,
