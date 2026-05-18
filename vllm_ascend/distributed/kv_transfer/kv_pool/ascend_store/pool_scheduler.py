@@ -104,6 +104,11 @@ class KVPoolScheduler:
             # K-layer buffering: when buffer is reused, need to reload previous chunks' KV.
             # Async sends from previous chunk may not be visible to this lookup yet,
             # so always set load_spec. start_load_kv will verify and correct if needed.
+            logger.info(
+                "KVPoolScheduler: req=%s use_layerwise=%s num_computed=%d num_external=%d",
+                request.request_id, self.use_layerwise, num_computed_tokens,
+                num_external_hit_tokens,
+            )
             if self.use_layerwise and num_computed_tokens > 0:
                 self.load_specs[request.request_id] = LoadSpec(
                     vllm_cached_tokens=0,
