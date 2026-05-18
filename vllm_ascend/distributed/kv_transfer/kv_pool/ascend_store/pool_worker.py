@@ -268,6 +268,11 @@ class KVPoolWorker:
         for buf_idx in range(self.num_kv_buffer_layers):
             self._on_buffer_free(buf_idx)
 
+        logger.info(
+            "_init_prefetch: precomputed %d layers, fired %d initial prefetches",
+            len(self._load_meta), len(self._prefetch_futures),
+        )
+
     # ==================== End Prefetch ====================
 
     def _load_layer_kv(self, connector_metadata: AscendConnectorMetadata, layer_id: int) -> None:
@@ -463,6 +468,54 @@ class KVPoolWorker:
                 for buf_idx in range(self.num_kv_buffer_layers):
                     while self.buffer_pending_counts[buf_idx] > 0:
                         self.buffer_condition.wait()
+
+        # Late lookup: scheduler may have missed blocks whose async sends
+        # from the previous chunk just completed. Re-check and fix load_spec.
+        if self.is_klayer_buffering_enabled():
+            for request in metadata.requests:
+                if request.load_spec is not None and request.load_spec.can_load:
+                    continue
+                if not request.block_hashes:
+                    continue
+                start_indices = []
+                end_indices = []
+                lookup_keys = []
+                for start, end, key in self.token_database.process_tokens(
+                    request.token_len_chunk, request.block_hashes, mask_num=0
+                ):
+                    start_indices.append(start)
+                    end_indices.append(end)
+                    lookup_keys.append(key.to_string())
+                if not lookup_keys:
+                    continue
+                kvpool_cached = end_indices[-1]  # default: all found
+                for idx, exist_val in enumerate(self.m_store.exists(lookup_keys)):
+                    if exist_val != 1:
+                        kvpool_cached = start_indices[idx]
+                        break
+                if kvpool_cached >= self.block_size:
+                    request.load_spec = LoadSpec(
+                        vllm_cached_tokens=0,
+                        kvpool_cached_tokens=kvpool_cached,
+                        can_load=True,
+                    )
+                    logger.debug(
+                        "Late lookup: request %s found %d tokens in pool",
+                        request.req_id, kvpool_cached,
+                    )
+
+        # Recompute after late lookup may have set new load specs
+        self._has_load_requests = any(
+            r.load_spec is not None and r.load_spec.can_load
+            for r in metadata.requests
+        )
+
+        logger.info(
+            "start_load_kv: _has_load_requests=%s, is_kbuffer=%s, num_requests=%d",
+            self._has_load_requests,
+            self.is_klayer_buffering_enabled(),
+            len(metadata.requests),
+        )
 
         # Initiate prefetch for layers that need KV pool loads
         self._init_prefetch(metadata)
