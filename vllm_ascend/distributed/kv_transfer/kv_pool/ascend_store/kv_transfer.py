@@ -3,7 +3,7 @@ import queue
 import threading
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from vllm.distributed.kv_events import BlockStored
@@ -308,6 +308,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         # Counter-based buffer sync for k-layer buffering (set by pool_worker)
         self.buffer_pending_counts: list[int] | None = None
         self.buffer_condition: threading.Condition | None = None
+        self.prefetch_callback: Callable[[int], None] | None = None
 
     def _get_buffer_idx(self, layer_id: int) -> int:
         """Get the physical buffer index for a given layer using explicit mapping."""
@@ -329,6 +330,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.buffer_pending_counts[buf_idx] -= 1
             if self.buffer_pending_counts[buf_idx] == 0:
                 self.buffer_condition.notify_all()
+                fired = True
+            else:
+                fired = False
+        # Trigger prefetch only when buffer is fully free
+        if fired and self.prefetch_callback is not None:
+            self.prefetch_callback(buf_idx)
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
