@@ -24,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     ChunkedTokenDatabase,
     KeyMetadata,
     LayerMultiBlockReqMeta,
+    LoadSpec,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
@@ -480,8 +481,9 @@ class KVPoolWorker:
                 start_indices = []
                 end_indices = []
                 lookup_keys = []
+                total_tokens = len(request.block_hashes) * self.block_size
                 for start, end, key in self.token_database.process_tokens(
-                    request.token_len_chunk, request.block_hashes, mask_num=0
+                    total_tokens, request.block_hashes, mask_num=0
                 ):
                     start_indices.append(start)
                     end_indices.append(end)
