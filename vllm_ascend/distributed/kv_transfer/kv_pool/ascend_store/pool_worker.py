@@ -392,6 +392,20 @@ class KVPoolWorker:
                 physical_buffer_addrs[physical_idx] = layer_addrs
 
         self.m_store.register_buffer(ptrs, lengths)
+
+        # Warm up Mooncake store connection to avoid lazy RDMA QP
+        # establishment cost (~300ms) on the first real put.
+        if ptrs:
+            warmup_key = f"__warmup__{self.kv_role}__tp{self.tp_rank}__"
+            try:
+                self.m_store.exists([warmup_key])
+                self.m_store.put(
+                    [warmup_key], [[ptrs[0]]], [[self.block_len[0]]]
+                )
+                logger.debug("Mooncake store connection warmed up")
+            except Exception:
+                pass  # best-effort
+
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
         self.token_database.set_num_kv_buffer_layers(self.num_kv_buffer_layers, self.num_layers)
