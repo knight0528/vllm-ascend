@@ -1,6 +1,7 @@
 import logging
 import queue
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
@@ -394,8 +395,18 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 size_list.append(size)
 
             if current_event is not None:
+                t0 = time.time()
                 current_event.synchronize()
+                logger.debug(
+                    "KV send: event sync %.2f ms for layer %d request %s",
+                    (time.time() - t0) * 1000, layer_id, req_meta.req_id[:8],
+                )
+            t0 = time.time()
             self.m_store.put(key_list, addr_list, size_list)
+            logger.debug(
+                "KV send: put %.2f ms for layer %d request %s",
+                (time.time() - t0) * 1000, layer_id, req_meta.req_id[:8],
+            )
 
             if layer_id == self.final_layer_id and is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
