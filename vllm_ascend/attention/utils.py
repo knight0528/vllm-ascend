@@ -2,8 +2,12 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any
 
+import time
+import traceback
+
 import torch
 import torch.nn.functional as F
+from vllm.logger import logger
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group, is_v1_kv_transfer_group
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -320,6 +324,11 @@ def wait_for_kv_layer_from_connector(layer_name: str):
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
+    connector._kv_t0 = time.time()
+    if not hasattr(connector, "_kv_path_logged"):
+        connector._kv_path_logged = True
+        logger.info("KV transfer entry: %s",
+                    traceback.extract_stack()[-3].filename)
     connector.wait_for_layer_load(layer_name)
 
 
@@ -337,6 +346,9 @@ def maybe_save_kv_layer_to_connector(
     if attn_metadata is None:
         return
     # TODO: assert ascendMetadata
+    _t1 = time.time()
+    dt = (_t1 - getattr(connector, "_kv_t0", _t1)) * 1000
+    logger.info("layer %s attention %.2f ms", layer_name, dt)
     connector.save_kv_layer(layer_name, kv_cache_layer, attn_metadata)
 
 
