@@ -397,13 +397,13 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             if current_event is not None:
                 t0 = time.time()
                 current_event.synchronize()
-                logger.debug(
+                logger.info(
                     "KV send: event sync %.2f ms for layer %d request %s",
                     (time.time() - t0) * 1000, layer_id, req_meta.req_id[:8],
                 )
             t0 = time.time()
             self.m_store.put(key_list, addr_list, size_list)
-            logger.debug(
+            logger.info(
                 "KV send: put %.2f ms for layer %d request %s",
                 (time.time() - t0) * 1000, layer_id, req_meta.req_id[:8],
             )
