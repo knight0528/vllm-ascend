@@ -384,7 +384,7 @@ class ReqMeta:
         num_tokens_to_save = (input_token_len // block_size * block_size) if discard_partial_chunks else input_token_len
 
         skip_save = skip_save or num_tokens_to_save < chunk_boundary
-        if skip_save and load_spec is None:
+        if skip_save and load_spec is None and tracker.num_saved_tokens == 0:
             return None
 
         # If we need to save, update the number of saved tokens

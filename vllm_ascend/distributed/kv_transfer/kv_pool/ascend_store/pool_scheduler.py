@@ -291,28 +291,21 @@ class KVPoolScheduler:
                         continue
                     request_tracker.update(new_block_ids)
 
-                    # K-layer buffering: need to load previous chunks' KV from KVPool
+                    # K-layer buffering: need to load previous chunks' KV from KVPool.
+                    # Async sends from previous chunk may not be visible yet,
+                    # so always set load_spec. start_load_kv will verify.
                     load_spec = None
-                    if (self.use_layerwise and num_computed_token > 0
-                            and request.block_hashes):
-                        # Lookup how many tokens are cached in KVPool
-                        if self._discard_partial_chunks:
-                            token_len = len(request.prompt_token_ids) // self._block_size * self._block_size
-                        else:
-                            token_len = len(request.prompt_token_ids)
-                        num_kvpool_hit = self.client.lookup(token_len, request.block_hashes)
-                        if num_kvpool_hit >= num_computed_token:
-                            load_spec = LoadSpec(
-                                vllm_cached_tokens=0,
-                                kvpool_cached_tokens=num_computed_token,
-                                can_load=True,
-                            )
-                            logger.info(
-                                "K-layer buffering: chunk %d+ loading %d tokens from KVPool for request %s",
-                                num_computed_token // scheduler_output.num_scheduled_tokens.get(req_id, 1) + 1,
-                                num_computed_token,
-                                req_id,
-                            )
+                    if self.use_layerwise and num_computed_token > 0:
+                        load_spec = LoadSpec(
+                            vllm_cached_tokens=0,
+                            kvpool_cached_tokens=num_computed_token,
+                            can_load=True,
+                        )
+                        logger.info(
+                            "K-layer buffering: setting load_spec for request %s "
+                            "(num_computed=%d)",
+                            req_id, num_computed_token,
+                        )
 
                     last_chunk_tokens_num = (
                         (len(request.prompt_token_ids) // self._block_size * self._block_size)
