@@ -193,6 +193,11 @@ class KVPoolScheduler:
         meta = AscendConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
         for request in scheduler_output.scheduled_new_reqs:
+            logger.info(
+                "build_meta new_reqs: req=%s num_computed=%d exists_tracker=%s",
+                request.req_id, request.num_computed_tokens,
+                request.req_id in self._request_trackers,
+            )
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = request.num_computed_tokens + scheduler_output.num_scheduled_tokens[request.req_id]
@@ -202,11 +207,14 @@ class KVPoolScheduler:
                 unfolded_block_ids = request.block_ids.copy()
             else:
                 unfolded_block_ids = request.block_ids[0].copy()
+            # Preserve num_saved_tokens from previous tracker so K-buffer
+            # can detect multi-chunk and reload previous chunks' KV
+            old_tracker = self._request_trackers.pop(request.req_id, None)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
                 token_len=num_tokens_to_compute,
                 allocated_block_ids=unfolded_block_ids,
-                num_saved_tokens=0,
+                num_saved_tokens=old_tracker.num_saved_tokens if old_tracker else 0,
                 token_ids=request.prompt_token_ids[:num_tokens_to_compute].copy(),
             )
             self._request_trackers[request.req_id] = request_tracker
@@ -276,6 +284,13 @@ class KVPoolScheduler:
                 else:
                     request_tracker = self._request_trackers[req_id]
                     num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    num_computed = cached_reqs.num_computed_tokens[i]
+                    logger.info(
+                        "build_meta cached_reqs: req=%s num_computed=%d "
+                        "saved_tokens=%d",
+                        req_id, num_computed,
+                        request_tracker.num_saved_tokens,
+                    )
                     req_tuple = self._unfinished_requests.get(req_id)
                     if req_tuple:
                         request = req_tuple[0]
