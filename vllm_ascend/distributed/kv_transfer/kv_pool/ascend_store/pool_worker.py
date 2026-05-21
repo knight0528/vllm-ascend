@@ -3,9 +3,11 @@ import logging
 import math
 import threading
 from collections.abc import Generator
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 from vllm.config import VllmConfig
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.distributed import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -22,6 +24,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     ChunkedTokenDatabase,
     KeyMetadata,
     LayerMultiBlockReqMeta,
+    LoadSpec,
     ReqMeta,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
@@ -90,6 +93,33 @@ class KVPoolWorker:
         self.current_layer = 0
         self.num_layers = model_config.get_num_layers(parallel_config)
 
+        # K-layer buffering: only allocate k physical layers on P node
+        self.num_kv_buffer_layers = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "kv_cache_layers", self.num_layers
+        )
+        # Cached connector_metadata for use in wait_for_layer_load
+        self._cached_connector_metadata: AscendConnectorMetadata | None = None
+        self._has_load_requests = False
+
+        # Validate and normalize num_kv_buffer_layers
+        warning_msgs = []
+        if not isinstance(self.num_kv_buffer_layers, int) or self.num_kv_buffer_layers <= 0:
+            warning_msgs.append(f"invalid kv_cache_layers={self.num_kv_buffer_layers}, must be positive integer")
+        elif self.num_kv_buffer_layers > self.num_layers:
+            warning_msgs.append(f"kv_cache_layers={self.num_kv_buffer_layers} > num_layers={self.num_layers}")
+        elif self.num_kv_buffer_layers < self.num_layers and not self.use_layerwise:
+            warning_msgs.append("K-layer buffering requires use_layerwise=True")
+
+        if warning_msgs:
+            for msg in warning_msgs:
+                logger.warning("K-layer buffering: %s, using all %d layers.", msg, self.num_layers)
+            self.num_kv_buffer_layers = self.num_layers
+
+        # Initialize buffer sync primitives for K-layer buffering
+        self.buffer_pending_counts: list[int] | None = None
+        self.buffer_condition: threading.Condition | None = None
+
+        # Initialize model config
         if self.use_mla:
             self.num_kv_head = 1
         else:
@@ -158,6 +188,148 @@ class KVPoolWorker:
 
         self.finished_store_req: set[str] = set()
 
+        # Prefetch: async load KV from pool into buffers before attention needs them
+        # Workers = K physical buffers (one prefetch per buffer at a time)
+        self._load_executor = ThreadPoolExecutor(max_workers=self.num_kv_buffer_layers)
+        self._prefetch_futures: dict[int, Future[None]] = {}  # layer_id → future
+        self._load_meta: dict[int, tuple[list[str], list[list[int]], list[list[int]]]] = {}
+
+    def is_klayer_buffering_enabled(self) -> bool:
+        return (
+            self.num_kv_buffer_layers > 0
+            and self.num_kv_buffer_layers < self.num_layers
+        )
+
+    def get_buffer_idx(self, layer_id: int) -> int:
+        if self.token_database.layer_to_buffer_map:
+            return self.token_database.layer_to_buffer_map.get(
+                layer_id, layer_id % self.num_kv_buffer_layers
+            )
+        return layer_id % self.num_kv_buffer_layers
+
+    def _check_buffer_sync_enabled(self) -> bool:
+        return self.is_klayer_buffering_enabled() and self.buffer_condition is not None
+
+    # ==================== Prefetch ====================
+
+    def _precompute_loads(self, metadata: AscendConnectorMetadata) -> None:
+        """Precompute keys/addrs/sizes for all layers that need loading."""
+        self._load_meta.clear()
+
+        for request in metadata.requests:
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+            token_len = load_spec.kvpool_cached_tokens
+            if token_len <= 0:
+                continue
+            mask_num = load_spec.vllm_cached_tokens // self.block_size * self.block_size
+
+            for start, end, key in self.token_database.process_tokens(
+                token_len, request.block_hashes, mask_num
+            ):
+                layer_keys = key.split_layers(self.num_layers)
+                for layer_id in range(self.num_layers):
+                    key_str = layer_keys[layer_id].to_string()
+                    addr, size = self.token_database.prepare_value_layer(
+                        start, end, request.block_ids, layer_id
+                    )
+                    if layer_id not in self._load_meta:
+                        self._load_meta[layer_id] = ([], [], [])
+                    k_list, a_list, s_list = self._load_meta[layer_id]
+                    k_list.append(key_str)
+                    a_list.append(addr)
+                    s_list.append(size)
+
+    def _submit_prefetch(self, layer_id: int) -> None:
+        """Submit an async m_store.get for one layer."""
+        keys, addrs, sizes = self._load_meta[layer_id]
+        if not keys:
+            return
+        future = self._load_executor.submit(self.m_store.get, keys, addrs, sizes)
+        self._prefetch_futures[layer_id] = future
+
+    def _on_buffer_free(self, buf_idx: int) -> None:
+        """Buffer freed: find next un-prefetched layer on this buffer and submit."""
+        for layer_id in sorted(self._load_meta.keys()):
+            if self.get_buffer_idx(layer_id) != buf_idx:
+                continue
+            if layer_id not in self._prefetch_futures:
+                self._submit_prefetch(layer_id)
+                return
+
+    def _init_prefetch(self, metadata: AscendConnectorMetadata) -> None:
+        """Precompute load data and fire initial prefetch for first layer on each buffer."""
+        self._prefetch_futures.clear()
+        if not self._has_load_requests or not self.is_klayer_buffering_enabled():
+            return
+
+        self._precompute_loads(metadata)
+
+        for buf_idx in range(self.num_kv_buffer_layers):
+            self._on_buffer_free(buf_idx)
+
+        logger.info(
+            "_init_prefetch: precomputed %d layers, fired %d initial prefetches",
+            len(self._load_meta), len(self._prefetch_futures),
+        )
+
+    # ==================== End Prefetch ====================
+
+    def _load_layer_kv(self, connector_metadata: AscendConnectorMetadata, layer_id: int) -> None:
+        if not self._has_load_requests:
+            return
+
+        future = self._prefetch_futures.pop(layer_id, None)
+        if future is not None:
+            future.result()
+            if layer_id == self.num_layers - 1:
+                for request in connector_metadata.requests:
+                    if request.load_spec is not None and request.load_spec.can_load:
+                        request.load_spec.can_load = False
+            return
+
+        # Fallback: synchronous load
+        for request in connector_metadata.requests:
+            load_spec = request.load_spec
+            if load_spec is None or not load_spec.can_load:
+                continue
+            if load_spec.kvpool_cached_tokens <= 0:
+                continue
+
+            token_len = load_spec.kvpool_cached_tokens
+            mask_num = load_spec.vllm_cached_tokens // self.block_size * self.block_size
+
+            keys = []
+            addr_list = []
+            size_list = []
+
+            for start, end, key in self.token_database.process_tokens(
+                token_len, request.block_hashes, mask_num
+            ):
+                layer_keys = key.split_layers(self.num_layers)
+                addr, size = self.token_database.prepare_value_layer(
+                    start, end, request.block_ids, layer_id
+                )
+                keys.append(layer_keys[layer_id].to_string())
+                addr_list.append(addr)
+                size_list.append(size)
+
+            if keys:
+                self.m_store.get(keys, addr_list, size_list)
+
+            if layer_id == self.num_layers - 1:
+                load_spec.can_load = False
+
+    def acquire_buffer(self, layer_id: int, count: int = 1) -> None:
+        if not self._check_buffer_sync_enabled():
+            return
+        buf_idx = self.get_buffer_idx(layer_id)
+        with self.buffer_condition:
+            while self.buffer_pending_counts[buf_idx] > 0:
+                self.buffer_condition.wait()
+            self.buffer_pending_counts[buf_idx] += count
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
         first_kv_cache = first_kv_cache_tuple[0]
@@ -188,19 +360,62 @@ class KVPoolWorker:
         self.kv_caches_base_addr = []
         ptrs = []
         lengths = []
+        seen_ptrs: set[int] = set()
         length = len(self.block_len)
-        for cache_or_caches in kv_caches.values():
-            # Normalize to always be a list of caches
-            for i, cache in enumerate(cache_or_caches, 0):
-                base_addr = cache.data_ptr()
-                region_len = self.num_blocks * self.block_len[i % length]
+        use_k_layer_buffering = self.num_kv_buffer_layers > 0 and self.num_kv_buffer_layers < self.num_layers
+        physical_buffer_addrs: dict[int, list[int]] = {}
+        physical_indices_seen: set[int] = set()
+
+        # Sort kv_caches by layer index to ensure consistent ordering
+        layer_items = sorted(
+            [(extract_layer_index(name), caches) for name, caches in kv_caches.items()],
+            key=lambda x: x[0]
+        )
+
+        # Build kv_caches_base_addr and physical_buffer_addrs
+        for layer_idx, cache_or_caches in layer_items:
+            # Collect addresses for this layer
+            layer_addrs = [cache.data_ptr() for cache in cache_or_caches]
+
+            # Build kv_caches_base_addr and deduplicate for m_store registration
+            for i, base_addr in enumerate(layer_addrs):
                 self.kv_caches_base_addr.append(base_addr)
-                ptrs.append(base_addr)
-                lengths.append(region_len)
+                if base_addr not in seen_ptrs:
+                    seen_ptrs.add(base_addr)
+                    ptrs.append(base_addr)
+                    lengths.append(self.num_blocks * self.block_len[i % length])
+
+            # Build physical buffer mapping for K-layer buffering
+            physical_idx = layer_idx % self.num_kv_buffer_layers if use_k_layer_buffering else layer_idx
+            if physical_idx not in physical_indices_seen:
+                physical_indices_seen.add(physical_idx)
+                physical_buffer_addrs[physical_idx] = layer_addrs
 
         self.m_store.register_buffer(ptrs, lengths)
+
+        # Warm up Mooncake store connection to avoid lazy RDMA QP
+        # establishment cost (~300ms) on the first real put.
+        if ptrs:
+            warmup_key = f"__warmup__{self.kv_role}__tp{self.tp_rank}__"
+            try:
+                self.m_store.exists([warmup_key])
+                self.m_store.put(
+                    [warmup_key], [[ptrs[0]]], [[self.block_len[0]]]
+                )
+                logger.debug("Mooncake store connection warmed up")
+            except Exception:
+                pass  # best-effort
+
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
+        self.token_database.set_num_kv_buffer_layers(self.num_kv_buffer_layers, self.num_layers)
+
+        if physical_buffer_addrs:
+            self.token_database.set_physical_buffer_addrs(physical_buffer_addrs)
+            logger.info(
+                "K-layer buffering: registered %d physical buffers for %d layers",
+                len(physical_buffer_addrs), len(layer_items)
+            )
 
         if self.use_layerwise:
             self.get_event = threading.Event()
@@ -256,9 +471,78 @@ class KVPoolWorker:
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers = []
+        self._cached_connector_metadata = metadata
+        self._has_load_requests = any(
+            r.load_spec is not None and r.load_spec.can_load
+            for r in metadata.requests
+        )
+
+        # For K-layer buffering: wait for all pending sends from previous chunk
+        if self.is_klayer_buffering_enabled() and self.buffer_pending_counts is not None:
+            with self.buffer_condition:
+                for buf_idx in range(self.num_kv_buffer_layers):
+                    while self.buffer_pending_counts[buf_idx] > 0:
+                        self.buffer_condition.wait()
+
+        # Late lookup: scheduler may have set load_spec before async sends
+        # from the previous chunk completed. Re-verify actual pool contents.
+        if self.is_klayer_buffering_enabled():
+            for request in metadata.requests:
+                if not request.block_hashes:
+                    continue
+                start_indices = []
+                end_indices = []
+                lookup_keys = []
+                total_tokens = len(request.block_hashes) * self.block_size
+                for start, end, key in self.token_database.process_tokens(
+                    total_tokens, request.block_hashes, mask_num=0
+                ):
+                    start_indices.append(start)
+                    end_indices.append(end)
+                    lookup_keys.append(key.to_string())
+                if not lookup_keys:
+                    continue
+                kvpool_cached = end_indices[-1]  # default: all found
+                for idx, exist_val in enumerate(self.m_store.exists(lookup_keys)):
+                    if exist_val != 1:
+                        kvpool_cached = start_indices[idx]
+                        break
+                if kvpool_cached >= self.block_size:
+                    request.load_spec = LoadSpec(
+                        vllm_cached_tokens=0,
+                        kvpool_cached_tokens=kvpool_cached,
+                        can_load=True,
+                    )
+                    logger.debug(
+                        "Late lookup: request %s found %d tokens in pool",
+                        request.req_id, kvpool_cached,
+                    )
+                else:
+                    request.load_spec = None
+                    logger.debug(
+                        "Late lookup: request %s no tokens in pool, cleared load_spec",
+                        request.req_id,
+                    )
+
+        # Recompute after late lookup may have set new load specs
+        self._has_load_requests = any(
+            r.load_spec is not None and r.load_spec.can_load
+            for r in metadata.requests
+        )
+
+        logger.info(
+            "start_load_kv: _has_load_requests=%s, is_kbuffer=%s, num_requests=%d",
+            self._has_load_requests,
+            self.is_klayer_buffering_enabled(),
+            len(metadata.requests),
+        )
+
+        # Initiate prefetch for layers that need KV pool loads
+        self._init_prefetch(metadata)
+
         for request in metadata.requests:
             load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:  # load =0
+            if load_spec is None or not load_spec.can_load:
                 continue
             token_len = request.token_len_chunk
             if (load_spec.kvpool_cached_tokens % self.block_size != 0) and (
@@ -268,9 +552,13 @@ class KVPoolWorker:
             else:
                 token_len = request.load_spec.kvpool_cached_tokens
             request.load_spec.token_len = token_len
-            if self.use_layerwise:
+            if self.is_klayer_buffering_enabled():
+                # K-buffer: loading happens per-layer in wait_for_layer_load
+                # via _load_layer_kv_before_attention -> _load_layer_kv
+                continue
+            elif self.use_layerwise:
                 layerwise_retriever = self.retrieve_layer(request)
-                next(layerwise_retriever)  # first layer load
+                next(layerwise_retriever)
                 self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 if self.load_async:
@@ -298,16 +586,34 @@ class KVPoolWorker:
                     )
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
 
-    def wait_for_layer_load(self) -> None:
+    def wait_for_layer_load(self, layer_name: str = "") -> None:
+        if self.is_klayer_buffering_enabled() and self._cached_connector_metadata is not None:
+            layer_id = extract_layer_index(layer_name) if layer_name else self.current_layer
+            if layer_id < self.num_layers:
+                self._load_layer_kv_before_attention(layer_id)
+
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
-                logger.debug("Retrieved %s tokens", num_retrieved_tokens)
+                logger.debug(f"Retrieved {num_retrieved_tokens} tokens")
 
-    def save_kv_layer(self, connector_metadata: AscendConnectorMetadata) -> None:
-        if self.current_layer == 0:
+        self.current_layer = self.current_layer + 1
+
+    def _load_layer_kv_before_attention(self, layer_id: int) -> None:
+        if layer_id >= self.num_kv_buffer_layers:
+            self.acquire_buffer(layer_id, count=len(self.layerwise_storers))
+        self._load_layer_kv(self._cached_connector_metadata, layer_id)
+
+    def save_kv_layer(
+        self, connector_metadata: AscendConnectorMetadata, layer_name: str = ""
+    ) -> None:
+        layer_idx = extract_layer_index(layer_name) if layer_name else self.current_layer - 1 if self.current_layer > 0 else 0
+        if layer_idx >= self.num_layers:
+            return
+
+        if layer_idx == 0:
             self.layerwise_storers = []
             current_event = None
             for request in connector_metadata.requests:
@@ -324,12 +630,22 @@ class KVPoolWorker:
 
                 layerwise_storer = self.store_layer(request, current_event)
                 self.layerwise_storers.append(layerwise_storer)
+            if self.is_klayer_buffering_enabled():
+                self.buffer_pending_counts = [0] * self.num_kv_buffer_layers
+                self.buffer_condition = threading.Condition()
+                if self.kv_send_thread is not None:
+                    self.kv_send_thread.buffer_pending_counts = self.buffer_pending_counts
+                    self.kv_send_thread.buffer_condition = self.buffer_condition
+                    self.kv_send_thread.prefetch_callback = self._on_buffer_free
+
+        if self.is_klayer_buffering_enabled() and layer_idx < self.num_kv_buffer_layers:
+            self.acquire_buffer(layer_idx, count=len(self.layerwise_storers))
+
         for layerwise_storer in self.layerwise_storers:
             try:
                 next(layerwise_storer)
             except Exception:
                 raise
-        self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
         current_event = None
@@ -505,6 +821,12 @@ class KVPoolWorker:
         return done_sending, done_recving
 
     def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
+        if self.use_layerwise:
+            # Layerwise path: KVCacheStoreLayerSendingThread uses the base class
+            # finished_requests set (set_finished_request in _handle_request).
+            return self.kv_send_thread.get_and_clear_finished_requests()  # type: ignore[union-attr]
+
+        # Non-layerwise path: uses stored_requests counter on KVCacheStoreSendingThread
         finished_sending = set()
         for req_id in meta.preempted_req_ids:
             self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]

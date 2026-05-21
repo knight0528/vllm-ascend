@@ -101,6 +101,21 @@ class KVPoolScheduler:
         )
 
         if need_to_allocate <= 0:
+            # K-layer buffering: when buffer is reused, need to reload previous chunks' KV.
+            # Async sends from previous chunk may not be visible to this lookup yet,
+            # so always set load_spec. start_load_kv will verify and correct if needed.
+            logger.info(
+                "KVPoolScheduler: req=%s use_layerwise=%s num_computed=%d num_external=%d",
+                request.request_id, self.use_layerwise, num_computed_tokens,
+                num_external_hit_tokens,
+            )
+            if self.use_layerwise and num_computed_tokens > 0:
+                self.load_specs[request.request_id] = LoadSpec(
+                    vllm_cached_tokens=0,
+                    kvpool_cached_tokens=num_computed_tokens,
+                    can_load=True,
+                )
+                return 0, True
             return 0, False
 
         self.load_specs[request.request_id] = LoadSpec(
@@ -129,8 +144,12 @@ class KVPoolScheduler:
             return
 
         if num_external_tokens == 0:
-            # No need to load anything
-            self.load_specs[request.request_id].can_load = False
+            # K-layer buffering: keep can_load=True if we need to reload previous chunks
+            # This happens when buffer is reused and we need to load previously computed KV
+            if self.use_layerwise and self.load_specs[request.request_id].kvpool_cached_tokens > 0:
+                pass  # Keep can_load=True as set in get_num_new_matched_tokens
+            else:
+                self.load_specs[request.request_id].can_load = False
             return
 
         assert (
@@ -174,6 +193,11 @@ class KVPoolScheduler:
         meta = AscendConnectorMetadata(self._unfinished_request_ids, scheduler_output.preempted_req_ids)
 
         for request in scheduler_output.scheduled_new_reqs:
+            logger.info(
+                "build_meta new_reqs: req=%s num_computed=%d exists_tracker=%s",
+                request.req_id, request.num_computed_tokens,
+                request.req_id in self._request_trackers,
+            )
             # Right now, we only load KV for new requests
             load_spec = self.load_specs.pop(request.req_id, None)
             num_tokens_to_compute = request.num_computed_tokens + scheduler_output.num_scheduled_tokens[request.req_id]
@@ -183,11 +207,14 @@ class KVPoolScheduler:
                 unfolded_block_ids = request.block_ids.copy()
             else:
                 unfolded_block_ids = request.block_ids[0].copy()
+            # Preserve num_saved_tokens from previous tracker so K-buffer
+            # can detect multi-chunk and reload previous chunks' KV
+            old_tracker = self._request_trackers.pop(request.req_id, None)
             request_tracker = RequestTracker(
                 req_id=request.req_id,
                 token_len=num_tokens_to_compute,
                 allocated_block_ids=unfolded_block_ids,
-                num_saved_tokens=0,
+                num_saved_tokens=old_tracker.num_saved_tokens if old_tracker else 0,
                 token_ids=request.prompt_token_ids[:num_tokens_to_compute].copy(),
             )
             self._request_trackers[request.req_id] = request_tracker
@@ -257,6 +284,13 @@ class KVPoolScheduler:
                 else:
                     request_tracker = self._request_trackers[req_id]
                     num_new_tokens = scheduler_output.num_scheduled_tokens[req_id]
+                    num_computed = cached_reqs.num_computed_tokens[i]
+                    logger.info(
+                        "build_meta cached_reqs: req=%s num_computed=%d "
+                        "saved_tokens=%d",
+                        req_id, num_computed,
+                        request_tracker.num_saved_tokens,
+                    )
                     req_tuple = self._unfinished_requests.get(req_id)
                     if req_tuple:
                         request = req_tuple[0]
@@ -272,6 +306,22 @@ class KVPoolScheduler:
                         continue
                     request_tracker.update(new_block_ids)
 
+                    # K-layer buffering: need to load previous chunks' KV from KVPool.
+                    # Async sends from previous chunk may not be visible yet,
+                    # so always set load_spec. start_load_kv will verify.
+                    load_spec = None
+                    if self.use_layerwise and num_computed_token > 0:
+                        load_spec = LoadSpec(
+                            vllm_cached_tokens=0,
+                            kvpool_cached_tokens=num_computed_token,
+                            can_load=True,
+                        )
+                        logger.info(
+                            "K-layer buffering: setting load_spec for request %s "
+                            "(num_computed=%d)",
+                            req_id, num_computed_token,
+                        )
+
                     last_chunk_tokens_num = (
                         (len(request.prompt_token_ids) // self._block_size * self._block_size)
                         if self._discard_partial_chunks
@@ -280,7 +330,7 @@ class KVPoolScheduler:
                     req_meta = ReqMeta.from_request_tracker(
                         request_tracker,
                         self._block_size,
-                        load_spec=None,
+                        load_spec=load_spec,
                         skip_save=force_skip_save,
                         block_hashes=request.block_hashes,
                         is_last_chunk=request_tracker.token_len >= last_chunk_tokens_num,
