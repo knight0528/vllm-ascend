@@ -1,9 +1,10 @@
 import logging
 import queue
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Callable
 
 import torch
 from vllm.distributed.kv_events import BlockStored
@@ -68,9 +69,46 @@ class KVTransferThread(threading.Thread):
         with self.done_task_lock:
             self.finished_requests.add(req_id)
 
+    def _warmup_store_connection(self):
+        """Pre-establish RDMA QP and metadata-server connections.
+
+        Every real _handle_request call does: lookup (exists) → put.
+        Both can be slow on the first call: exists needs a metadata-server
+        round-trip and put needs RDMA QP establishment.  Warm both paths
+        using real-looking keys so the first real request is fast.
+
+        Also warm each physical buffer's base address so RDMA QPs are
+        established for all registered memory regions.
+        """
+        try:
+            if not (hasattr(self, 'token_database')
+                    and self.token_database.kv_caches_base_addr):
+                return
+            addrs = self.token_database.kv_caches_base_addr
+            b_len = self.token_database.block_len
+            if not b_len:
+                return
+            size = b_len[0]
+            import time
+            ts = int(time.time())
+            # Warm each registered buffer (deduplicated by address)
+            seen = set()
+            for i, base in enumerate(addrs):
+                if base in seen:
+                    continue
+                seen.add(base)
+                warmup_key = (
+                    f"__warmup__tp{self.tp_rank}__ts{ts}__buf{i}__"
+                )
+                self.m_store.exists([warmup_key])
+                self.m_store.put([warmup_key], [[base]], [[size]])
+        except Exception:
+            pass  # best-effort
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         self.m_store.set_device()
+        self._warmup_store_connection()
         self.ready_event.set()
         while True:
             try:
@@ -305,72 +343,130 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
+        # Counter-based buffer sync for k-layer buffering (set by pool_worker)
+        self.buffer_pending_counts: list[int] | None = None
+        self.buffer_condition: threading.Condition | None = None
+        self.prefetch_callback: Callable[[int], None] | None = None
+
+    def _get_buffer_idx(self, layer_id: int) -> int:
+        """Get the physical buffer index for a given layer using explicit mapping."""
+        if self.token_database.layer_to_buffer_map:
+            if layer_id not in self.token_database.layer_to_buffer_map:
+                raise KeyError(
+                    f"K-layer buffering: layer {layer_id} not found in layer_to_buffer_map. "
+                    f"Available layers: {list(self.token_database.layer_to_buffer_map.keys())}."
+                )
+            return self.token_database.layer_to_buffer_map[layer_id]
+        return layer_id % len(self.buffer_pending_counts) if self.buffer_pending_counts else layer_id
+
+    def _notify_buffer_available(self, layer_id: int):
+        """Decrement pending count for the physical buffer; wake waiters when it hits 0."""
+        if self.buffer_condition is None:
+            return
+        buf_idx = self._get_buffer_idx(layer_id)
+        with self.buffer_condition:
+            old_count = self.buffer_pending_counts[buf_idx]
+            self.buffer_pending_counts[buf_idx] -= 1
+            new_count = self.buffer_pending_counts[buf_idx]
+            if new_count == 0:
+                self.buffer_condition.notify_all()
+                fired = True
+            else:
+                fired = False
+        logger.info(
+            "_notify_buffer_available: layer=%d buf_idx=%d count %d->%d fired=%s",
+            layer_id, buf_idx, old_count, new_count, fired,
+        )
+        # Trigger prefetch only when buffer is fully free
+        if fired and self.prefetch_callback is not None:
+            self.prefetch_callback(buf_idx)
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
-    def _handle_request(  # type: ignore[override]
-        self, req_meta: LayerMultiBlockReqMeta
-    ):
+    def _handle_request(self, req_meta: LayerMultiBlockReqMeta):
+        """Process a single layer's KV cache store request with try-finally safety."""
         starts = req_meta.starts
         ends = req_meta.ends
         keys = req_meta.keys
         layer_id = req_meta.layer_id
-        current_event = req_meta.current_event
-        total_block = len(keys)
         is_last_chunk = req_meta.is_last_chunk
+        total_block = len(keys)
+
+        logger.info(
+            "_handle_request: START layer=%d blocks=%d req=%s is_last=%s",
+            layer_id, total_block, req_meta.req_id[:8], is_last_chunk,
+        )
+
         if not self.dcp_size > 1:
             starts = starts[self.tp_rank % self.put_step :: self.put_step]
             ends = ends[self.tp_rank % self.put_step :: self.put_step]
             keys = keys[self.tp_rank % self.put_step :: self.put_step]
 
         if not keys:
+            logger.info(
+                "_handle_request: NO_KEYS layer=%d req=%s",
+                layer_id, req_meta.req_id[:8],
+            )
             if is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
+            self._notify_buffer_available(layer_id)
+            self.request_queue.task_done()
             return
 
-        key_list = []
-        for key in keys:
-            key_list.append(key.to_string())
-
+        key_list = [k.to_string() for k in keys]
         exists_states = self.lookup(key_list)
-        missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
+        missing_indices = [i for i, e in enumerate(exists_states) if not e]
 
         if not missing_indices:
+            logger.info(
+                "_handle_request: ALL_EXIST layer=%d blocks=%d req=%s",
+                layer_id, total_block, req_meta.req_id[:8],
+            )
             if is_last_chunk and layer_id == self.final_layer_id:
                 self.set_finished_request(req_meta.req_id)
+            self._notify_buffer_available(layer_id)
+            self.request_queue.task_done()
             return
 
-        starts = [starts[index] for index in missing_indices]
-        ends = [ends[index] for index in missing_indices]
-        key_list = [key_list[index] for index in missing_indices]
+        starts = [starts[i] for i in missing_indices]
+        ends = [ends[i] for i in missing_indices]
+        key_list = [key_list[i] for i in missing_indices]
+        skip_block_num = total_block - len(key_list)
 
-        addr_list = []
-        size_list = []
-        for index, key in enumerate(key_list):
-            addr, size = self.token_database.prepare_value_layer(
-                starts[index], ends[index], req_meta.block_ids, layer_id
+        try:
+            addr_list = []
+            size_list = []
+            for i, key in enumerate(key_list):
+                addr, size = self.token_database.prepare_value_layer(
+                    starts[i], ends[i], req_meta.block_ids, layer_id
+                )
+                addr_list.append(addr)
+                size_list.append(size)
+
+            t0 = time.time()
+            self.m_store.put(key_list, addr_list, size_list)
+            logger.info(
+                "KV send: put %.2f ms for layer %d request %s",
+                (time.time() - t0) * 1000, layer_id, req_meta.req_id[:8],
             )
-            addr_list.append(addr)
-            size_list.append(size)
 
-        if current_event is not None:
-            current_event.synchronize()
-        self.m_store.put(key_list, addr_list, size_list)
+            if layer_id == self.final_layer_id and is_last_chunk:
+                self.set_finished_request(req_meta.req_id)
 
-        if layer_id == self.final_layer_id and is_last_chunk:
-            self.set_finished_request(req_meta.req_id)
-        self.request_queue.task_done()
-
-        logger.info(
-            "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s",
-            len(key_list),
-            total_block,
-            len(missing_indices),
-            req_meta.req_id,
-        )
+            logger.info(
+                "Storing KV cache for %d out of %d blocks (skip=%d) for request %s",
+                len(key_list), total_block, skip_block_num, req_meta.req_id,
+            )
+        finally:
+            logger.info(
+                "_handle_request: FINISH layer=%d req=%s",
+                layer_id, req_meta.req_id[:8],
+            )
+            self._notify_buffer_available(layer_id)
+            self.request_queue.task_done()
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
