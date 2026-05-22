@@ -181,7 +181,7 @@ class AscendStoreConnector(KVConnectorBase_V1):
     def wait_for_layer_load(self, layer_name: str) -> None:
         if not self.use_layerwise:
             return
-        self.connector_worker.wait_for_layer_load()
+        self.connector_worker.wait_for_layer_load(layer_name)
 
     def save_kv_layer(
         self, layer_name: str, kv_layer: torch.Tensor, attn_metadata: "AttentionMetadata", **kwargs
@@ -192,16 +192,16 @@ class AscendStoreConnector(KVConnectorBase_V1):
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
-        self.connector_worker.save_kv_layer(self._get_connector_metadata())
+        self.connector_worker.save_kv_layer(self._get_connector_metadata(), layer_name)
 
     def wait_for_save(self):
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             # Don't do save if the role is kv_consumer
             return
 
-        if self.use_layerwise:
-            return
-
+        # In layerwise mode, we still need to wait for KV save to complete
+        # before starting the next chunk. Otherwise, late lookup will fail because
+        # the KV from the previous chunk hasn't been saved yet.
         self.connector_worker.wait_for_save(self._get_connector_metadata())
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:

@@ -392,6 +392,24 @@ class NPUWorker(WorkerBase):
             "Available KV cache memory: %.2f GiB", GiB(self.available_kv_cache_memory_bytes), scope="local"
         )
 
+        # K-layer buffering: scale available memory to allocate more blocks
+        if (self.kv_transfer_config is not None and self.kv_transfer_config.is_kv_producer):
+            kv_cache_layers = self.kv_transfer_config.kv_connector_extra_config.get("kv_cache_layers", 0)
+            if kv_cache_layers > 0:
+                num_layers = getattr(self.model_config.hf_text_config, "num_hidden_layers", 0)
+                if num_layers > kv_cache_layers:
+                    scale_factor = num_layers / kv_cache_layers
+                    self.available_kv_cache_memory_bytes = int(
+                        self.available_kv_cache_memory_bytes * scale_factor
+                    )
+                    logger.info_once(
+                        "K-layer buffering enabled: %d layers -> %d buffers, "
+                        "scaled KV cache memory by %.1fx to %.2f GiB",
+                        num_layers, kv_cache_layers, scale_factor,
+                        GiB(self.available_kv_cache_memory_bytes),
+                        scope="local",
+                    )
+
         return int(self.available_kv_cache_memory_bytes)
 
     def execute_model(
