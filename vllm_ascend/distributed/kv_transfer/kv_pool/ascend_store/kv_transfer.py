@@ -365,21 +365,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             return
         buf_idx = self._get_buffer_idx(layer_id)
         with self.buffer_condition:
-            old_count = self.buffer_pending_counts[buf_idx]
             self.buffer_pending_counts[buf_idx] -= 1
-            new_count = self.buffer_pending_counts[buf_idx]
-            if new_count == 0:
+            if self.buffer_pending_counts[buf_idx] == 0:
                 self.buffer_condition.notify_all()
-                fired = True
-            else:
-                fired = False
-        logger.info(
-            "_notify_buffer_available: layer=%d buf_idx=%d count %d->%d fired=%s",
-            layer_id, buf_idx, old_count, new_count, fired,
-        )
-        # Trigger prefetch only when buffer is fully free
-        if fired and self.prefetch_callback is not None:
-            self.prefetch_callback(buf_idx)
+                # Trigger prefetch only when buffer is fully free
+                if self.prefetch_callback is not None:
+                    self.prefetch_callback(buf_idx)
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
@@ -395,21 +386,12 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         is_last_chunk = req_meta.is_last_chunk
         total_block = len(keys)
 
-        logger.info(
-            "_handle_request: START layer=%d blocks=%d req=%s is_last=%s",
-            layer_id, total_block, req_meta.req_id[:8], is_last_chunk,
-        )
-
         if not self.dcp_size > 1:
             starts = starts[self.tp_rank % self.put_step :: self.put_step]
             ends = ends[self.tp_rank % self.put_step :: self.put_step]
             keys = keys[self.tp_rank % self.put_step :: self.put_step]
 
         if not keys:
-            logger.info(
-                "_handle_request: NO_KEYS layer=%d req=%s",
-                layer_id, req_meta.req_id[:8],
-            )
             if is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
             self._notify_buffer_available(layer_id)
@@ -421,10 +403,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         missing_indices = [i for i, e in enumerate(exists_states) if not e]
 
         if not missing_indices:
-            logger.info(
-                "_handle_request: ALL_EXIST layer=%d blocks=%d req=%s",
-                layer_id, total_block, req_meta.req_id[:8],
-            )
             if is_last_chunk and layer_id == self.final_layer_id:
                 self.set_finished_request(req_meta.req_id)
             self._notify_buffer_available(layer_id)
@@ -461,10 +439,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
                 len(key_list), total_block, skip_block_num, req_meta.req_id,
             )
         finally:
-            logger.info(
-                "_handle_request: FINISH layer=%d req=%s",
-                layer_id, req_meta.req_id[:8],
-            )
             self._notify_buffer_available(layer_id)
             self.request_queue.task_done()
 

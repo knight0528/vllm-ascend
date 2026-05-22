@@ -262,16 +262,8 @@ class KVPoolWorker:
             if self.get_buffer_idx(layer_id) != buf_idx:
                 continue
             if layer_id not in self._prefetch_futures:
-                logger.info(
-                    "_on_buffer_free: buf_idx=%d firing prefetch for layer=%d",
-                    buf_idx, layer_id,
-                )
                 self._submit_prefetch(layer_id)
                 return
-        logger.info(
-            "_on_buffer_free: buf_idx=%d no more layers to prefetch",
-            buf_idx,
-        )
 
     def _init_prefetch(self, metadata: AscendConnectorMetadata) -> None:
         """Precompute load data and fire initial prefetch for first layer on each buffer."""
@@ -287,11 +279,8 @@ class KVPoolWorker:
                 self._on_buffer_free(buf_idx)
 
         logger.info(
-            "_init_prefetch: precomputed %d layers, fired %d prefetches "
-            "(layers=%s), buffer_pending_counts=%s",
+            "_init_prefetch: precomputed %d layers, fired %d initial prefetches",
             len(self._load_meta), len(self._prefetch_futures),
-            list(self._prefetch_futures.keys()),
-            list(self.buffer_pending_counts) if self.buffer_pending_counts else None,
         )
 
     # ==================== End Prefetch ====================
@@ -354,18 +343,9 @@ class KVPoolWorker:
             return
         buf_idx = self.get_buffer_idx(layer_id)
         with self.buffer_condition:
-            if self.buffer_pending_counts[buf_idx] > 0:
-                logger.info(
-                    "acquire_buffer: BLOCKED layer=%d buf_idx=%d count=%d pending_counts=%s",
-                    layer_id, buf_idx, count, list(self.buffer_pending_counts),
-                )
             while self.buffer_pending_counts[buf_idx] > 0:
                 self.buffer_condition.wait()
             self.buffer_pending_counts[buf_idx] += count
-            logger.info(
-                "acquire_buffer: ACQUIRED layer=%d buf_idx=%d count=%d -> new_count=%d",
-                layer_id, buf_idx, count, self.buffer_pending_counts[buf_idx],
-            )
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         _, first_kv_cache_tuple = next(iter(kv_caches.items()))
@@ -512,13 +492,6 @@ class KVPoolWorker:
             logger.info(
                 "start_load_kv: lazy-init done, num_kv_buffer_layers=%d, num_layers=%d",
                 self.num_kv_buffer_layers, self.num_layers,
-            )
-
-        # Log buffer counts at start of each chunk (after wait_for_save should have zeroed them)
-        if self.is_klayer_buffering_enabled() and self.buffer_pending_counts is not None:
-            logger.info(
-                "start_load_kv: buffer_pending_counts=%s",
-                self.buffer_pending_counts,
             )
 
         # Per-chunk timing
@@ -774,20 +747,9 @@ class KVPoolWorker:
             if self.kv_send_thread is not None:
                 if self.is_klayer_buffering_enabled() and self.buffer_condition is not None:
                     with self.buffer_condition:
-                        counts_before = list(self.buffer_pending_counts)
-                        if any(c > 0 for c in counts_before):
-                            logger.info(
-                                "wait_for_save: waiting for buffers, counts=%s",
-                                counts_before,
-                            )
                         for buf_idx in range(self.num_kv_buffer_layers):
                             while self.buffer_pending_counts[buf_idx] > 0:
                                 self.buffer_condition.wait()
-                        if any(c > 0 for c in counts_before):
-                            logger.info(
-                                "wait_for_save: all buffers free, waited counts were=%s",
-                                counts_before,
-                            )
                 else:
                     self.kv_send_thread.request_queue.join()
             return
