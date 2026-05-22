@@ -693,14 +693,19 @@ class KVPoolWorker:
 
     def _load_layer_kv_before_attention(self, layer_id: int) -> None:
         if self.is_klayer_buffering_enabled():
-            if hasattr(self, 'layerwise_storers'):
-                count = len(self.layerwise_storers)
-            else:
-                # First layer: count savable requests from metadata instead of
-                # defaulting to 1, which would permanently reserve a buffer slot
-                # when no request actually has can_save=True.
-                count = sum(1 for r in self._cached_connector_metadata.requests
-                           if r.can_save)
+            count = 0
+            # One-rank-per-layer: only the owning TP rank needs buffer sync
+            # for this layer. Other ranks skip acquire — their local send
+            # thread won't touch this layer, so there's no buffer contention.
+            if self.put_step <= 1 or layer_id % self.tp_size == self.tp_rank:
+                if hasattr(self, 'layerwise_storers'):
+                    count = len(self.layerwise_storers)
+                else:
+                    # First layer: count savable requests from metadata instead of
+                    # defaulting to 1, which would permanently reserve a buffer slot
+                    # when no request actually has can_save=True.
+                    count = sum(1 for r in self._cached_connector_metadata.requests
+                               if r.can_save)
             if count > 0:
                 self.acquire_buffer(layer_id, count=count)
         self._load_layer_kv(self._cached_connector_metadata, layer_id)
@@ -883,6 +888,12 @@ class KVPoolWorker:
         if keys:
             keys = [list(row) for row in zip(*keys)]  # [layer_num,block_num]
             for layer_id, keys_multi_chunk in enumerate(keys):
+                # One-rank-per-layer: when put_step > 1 (MLA), only the
+                # owning TP rank queues the layer for sending. All ranks
+                # still yield to keep generator synchronization.
+                if self.put_step > 1 and layer_id % self.tp_size != self.tp_rank:
+                    yield
+                    continue
                 req_meta = LayerMultiBlockReqMeta(
                     request.req_id,
                     keys_multi_chunk,

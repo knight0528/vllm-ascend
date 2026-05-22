@@ -343,6 +343,10 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         self.final_layer_id = num_layers - 1
         self.put_step = put_step
         self.enable_kv_event = enable_kv_event
+        # When put_step > 1 (MLA with multiple TP ranks sharing the same
+        # head_or_tp_rank), use one-rank-per-layer: each layer is assigned
+        # to one TP rank to avoid cross-rank contention on the store.
+        self.use_one_rank_per_layer = (put_step > 1)
         # Counter-based buffer sync for k-layer buffering (set by pool_worker)
         self.buffer_pending_counts: list[int] | None = None
         self.buffer_condition: threading.Condition | None = None
@@ -386,7 +390,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         is_last_chunk = req_meta.is_last_chunk
         total_block = len(keys)
 
-        if not self.dcp_size > 1:
+        if not self.dcp_size > 1 and not self.use_one_rank_per_layer:
             starts = starts[self.tp_rank % self.put_step :: self.put_step]
             ends = ends[self.tp_rank % self.put_step :: self.put_step]
             keys = keys[self.tp_rank % self.put_step :: self.put_step]
