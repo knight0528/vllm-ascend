@@ -1,14 +1,12 @@
 import importlib
-import logging
 import math
 import threading
-import time
 from collections.abc import Generator
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
-
+from vllm.model_executor.models.utils import extract_layer_index
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.utils import extract_layer_index
 from vllm.distributed import (
     get_decode_context_model_parallel_rank,
     get_decode_context_model_parallel_world_size,
@@ -93,7 +91,6 @@ class KVPoolWorker:
             self.block_size *= self.dcp_size
         self.current_layer = 0
         self.num_layers = model_config.get_num_layers(parallel_config)
-
         # K-layer buffering: only allocate k physical layers on P node
         self.num_kv_buffer_layers = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "kv_cache_layers", self.num_layers
@@ -126,7 +123,6 @@ class KVPoolWorker:
         self.buffer_pending_counts: list[int] | None = None
         self.buffer_condition: threading.Condition | None = None
 
-        # Initialize model config
         if self.use_mla:
             self.num_kv_head = 1
         else:
@@ -344,7 +340,15 @@ class KVPoolWorker:
         buf_idx = self.get_buffer_idx(layer_id)
         with self.buffer_condition:
             while self.buffer_pending_counts[buf_idx] > 0:
-                self.buffer_condition.wait()
+                self.buffer_condition.wait(timeout=30.0)
+                if self.buffer_pending_counts[buf_idx] > 0:
+                    logger.warning(
+                        "acquire_buffer: buffer %d still pending (count=%d) after 30s, "
+                        "send_thread alive=%s, queue_size=%d",
+                        buf_idx, self.buffer_pending_counts[buf_idx],
+                        self.kv_send_thread.is_alive() if self.kv_send_thread else False,
+                        self.kv_send_thread.request_queue.qsize() if self.kv_send_thread else -1,
+                    )
             self.buffer_pending_counts[buf_idx] += count
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -409,7 +413,6 @@ class KVPoolWorker:
                 physical_buffer_addrs[physical_idx] = layer_addrs
 
         self.m_store.register_buffer(ptrs, lengths)
-
         self.token_database.set_kv_caches_base_addr(self.kv_caches_base_addr)
         self.token_database.set_block_len(self.block_len)
         self.token_database.set_num_kv_buffer_layers(self.num_kv_buffer_layers, self.num_layers)
@@ -574,7 +577,7 @@ class KVPoolWorker:
 
         for request in metadata.requests:
             load_spec = request.load_spec
-            if load_spec is None or not load_spec.can_load:
+            if load_spec is None or not load_spec.can_load:  # load =0
                 continue
             token_len = request.token_len_chunk
             if (load_spec.kvpool_cached_tokens % self.block_size != 0) and (
@@ -590,7 +593,7 @@ class KVPoolWorker:
                 continue
             elif self.use_layerwise:
                 layerwise_retriever = self.retrieve_layer(request)
-                next(layerwise_retriever)
+                next(layerwise_retriever)  # first layer load
                 self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 if self.load_async:
@@ -619,29 +622,23 @@ class KVPoolWorker:
                     self.m_store.get(key_list_c, addr_list_c, size_list_c)
 
     def wait_for_layer_load(self, layer_name: str = "") -> None:
-        # 性能统计开始
         load_start_time = time.time() if self.is_klayer_buffering_enabled() else None
 
         if self.is_klayer_buffering_enabled() and self._cached_connector_metadata is not None:
             layer_id = extract_layer_index(layer_name) if layer_name else self.current_layer
             if layer_id < self.num_layers:
                 self._load_layer_kv_before_attention(layer_id)
-                # 优化：提前触发后续层的预取，形成流水线
                 self._prefetch_next_layers(layer_id)
-
         for layerwise_retriever in self.layerwise_retrievers:
             ret_token_mask = next(layerwise_retriever)
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
                 num_retrieved_tokens = ret_token_mask.sum().item()
                 logger.debug(f"Retrieved {num_retrieved_tokens} tokens")
-
         self.current_layer = self.current_layer + 1
 
-        # 性能统计结束
         if load_start_time is not None:
             load_time = (time.time() - load_start_time) * 1000  # ms
-            # 每10层打印一次性能统计
             if self.current_layer % 10 == 0:
                 logger.info(
                     f"K-layer buffering perf: layer {self.current_layer}, "
@@ -650,57 +647,33 @@ class KVPoolWorker:
                 )
 
     def _prefetch_next_layers(self, current_layer_id: int) -> None:
-        """
-        优化：提前触发后续层的预取，形成计算-传输流水线
-        在当前层计算时，后台异步加载后续层
-
-        优化策略：
-        1. 批量预取：一次性提交多个层的预取任务
-        2. 动态跳过：当buffer忙碌时跳过该buffer对应的层
-        3. 优先级调度：优先预取即将使用的层
-        """
         if not self._has_load_requests or not self.is_klayer_buffering_enabled():
             return
 
-        # 使用可配置的预取窗口，默认值为 min(num_kv_buffer_layers, 8)
-        # 可通过 kv_connector_extra_config.prefetch_window 配置
         prefetch_ahead = self.prefetch_window
 
-        # 收集可预取的层（按优先级排序）
         prefetch_candidates = []
         for next_layer_id in range(current_layer_id + 1, min(current_layer_id + prefetch_ahead, self.num_layers)):
             buf_idx = self.get_buffer_idx(next_layer_id)
-            # 检查buffer是否可用
             if self._check_buffer_sync_enabled() and self.buffer_pending_counts[buf_idx] > 0:
                 continue
-            # 检查是否已经预取
             if next_layer_id not in self._prefetch_futures:
                 prefetch_candidates.append(next_layer_id)
 
-        # 批量提交预取任务
         for layer_id in prefetch_candidates:
             self._submit_prefetch(layer_id)
 
-        # 优化：如果当前buffer都忙碌，尝试预取其他buffer的层
         if not prefetch_candidates:
-            # 查找最近的需要预取的层
             for next_layer_id in range(current_layer_id + 1, self.num_layers):
                 if next_layer_id not in self._prefetch_futures:
                     buf_idx = self.get_buffer_idx(next_layer_id)
-                    # 即使buffer忙碌，也尝试提交（后台会处理）
                     self._submit_prefetch(next_layer_id)
                     break
 
     def _load_layer_kv_before_attention(self, layer_id: int) -> None:
         if self.is_klayer_buffering_enabled():
-            if hasattr(self, 'layerwise_storers'):
-                count = len(self.layerwise_storers)
-            else:
-                # First layer: count savable requests from metadata instead of
-                # defaulting to 1, which would permanently reserve a buffer slot
-                # when no request actually has can_save=True.
-                count = sum(1 for r in self._cached_connector_metadata.requests
-                           if r.can_save)
+            count = sum(1 for r in self._cached_connector_metadata.requests
+                       if r.can_save)
             if count > 0:
                 self.acquire_buffer(layer_id, count=count)
         self._load_layer_kv(self._cached_connector_metadata, layer_id)
@@ -714,17 +687,11 @@ class KVPoolWorker:
 
         if layer_idx == 0:
             self.layerwise_storers = []
-            # FIX: Don't use current_event in layerwise mode
-            # The current_event.synchronize() call in _handle_request can cause
-            # permanent blocking because the event may not be properly recorded
-            # before the KV save starts. Instead, we rely on request_queue.join()
-            # to wait for KV save to complete.
             current_event = None
             for request in connector_metadata.requests:
                 can_save = request.can_save
                 if can_save is None or not can_save:
                     continue
-                # Don't create current_event here to avoid blocking
                 break
             for request in connector_metadata.requests:
                 can_save = request.can_save
@@ -733,14 +700,12 @@ class KVPoolWorker:
 
                 layerwise_storer = self.store_layer(request, current_event)
                 self.layerwise_storers.append(layerwise_storer)
-
-        # Buffer acquire already handled in _load_layer_kv_before_attention
-
         for layerwise_storer in self.layerwise_storers:
             try:
                 next(layerwise_storer)
             except Exception:
                 raise
+        self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
         if self.use_layerwise:
@@ -749,27 +714,23 @@ class KVPoolWorker:
                     with self.buffer_condition:
                         for buf_idx in range(self.num_kv_buffer_layers):
                             while self.buffer_pending_counts[buf_idx] > 0:
-                                self.buffer_condition.wait()
+                                self.buffer_condition.wait(timeout=30.0)
+                                if self.buffer_pending_counts[buf_idx] > 0:
+                                    logger.warning(
+                                        "wait_for_save: buffer %d still pending (count=%d) after 30s, "
+                                        "send_thread alive=%s, queue_size=%d",
+                                        buf_idx, self.buffer_pending_counts[buf_idx],
+                                        self.kv_send_thread.is_alive() if self.kv_send_thread else False,
+                                        self.kv_send_thread.request_queue.qsize() if self.kv_send_thread else -1,
+                                    )
                 else:
                     self.kv_send_thread.request_queue.join()
             return
-
-        # Non-layerwise mode: original implementation
-        current_event = None
-        for request in connector_metadata.requests:
-            can_save = request.can_save
-            if can_save is None or not can_save:
-                continue
-            current_event = torch.npu.Event()
-            current_event.record()
-            break
-
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
                 continue
 
-            request.current_event = current_event
             self.kv_send_thread.add_stored_request(  # type: ignore[union-attr]
                 request.req_id
             )
@@ -842,7 +803,7 @@ class KVPoolWorker:
                 yield None
 
         retrieved_tokens = torch.sum(ret_mask)
-        logger.debug("Retrieved %s out of %s out of total %s tokens", retrieved_tokens, num_required_tokens, token_len)
+        logger.debug(f"Retrieved {retrieved_tokens} out of {num_required_tokens} out of total {token_len} tokens")
 
         yield ret_mask
 
@@ -892,6 +853,7 @@ class KVPoolWorker:
                     layer_id,
                     request.is_last_chunk,
                     current_event,
+                    skip_exists=True,
                 )
                 self.kv_send_thread.add_request(  # type: ignore[union-attr, call-arg]
                     req_meta
@@ -918,13 +880,12 @@ class KVPoolWorker:
             else set()
         )
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
-                len(done_sending),
-                len(done_recving),
-                self.tp_rank,
-            )
+        logger.debug(
+            "Number of completed KV cache send requests: %d, receive requests: %d, tp_rank:%d",
+            len(done_sending),
+            len(done_recving),
+            self.tp_rank,
+        )
         return done_sending, done_recving
 
     def get_and_clear_finished_requests(self, finished_req_ids, meta: AscendConnectorMetadata) -> set[str]:
@@ -941,8 +902,6 @@ class KVPoolWorker:
                 if r not in finished_req_ids:
                     self.kv_send_thread.set_finished_request(r)  # type: ignore[union-attr]
             return finished_sending
-
-        # Non-layerwise path: uses stored_requests counter on KVCacheStoreSendingThread
         finished_sending = set()
         for req_id in meta.preempted_req_ids:
             self.kv_send_thread.delete_finished_stored_request(  # type: ignore[union-attr]
@@ -1010,7 +969,7 @@ class KVPoolWorker:
                     return starts[index]
             # all tokens where found, return the maximal end
         except Exception as e:
-            logger.error("Remote connection failed in contains: %s", e)
+            logger.error(f"Remote connection failed in contains: {e}")
             return 0
         return end
 
@@ -1068,7 +1027,7 @@ class KVPoolWorker:
                 return starts[index]
         # all tokens where found, return the maximal end
         except Exception as e:
-            logger.error("Remote connection failed in contains: %s", e)
+            logger.error(f"Remote connection failed in contains: {e}")
             return 0
         return end
 

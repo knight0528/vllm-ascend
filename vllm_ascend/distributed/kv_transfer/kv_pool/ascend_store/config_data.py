@@ -159,7 +159,6 @@ class ChunkedTokenDatabase:
     def prepare_value_layer(self, start: int, end: int, block_ids: list[int], layer_id: int):
         block_id = block_ids[start // self.block_size]
         length = len(self.block_len)
-
         # Resolve physical layer for K-layer buffering
         physical_layer = self.layer_to_buffer_map[layer_id] if self.layer_to_buffer_map else layer_id
 
@@ -406,7 +405,7 @@ class ReqMeta:
         else:
             # Do not load if not in `can_load` state
             load_spec = None
-        logger.debug("request:%s, meta save spec:%s, meta load spec:%s", tracker.req_id, not skip_save, load_spec)
+        logger.debug(f"request:{tracker.req_id}, meta save spec:{not skip_save}, meta load spec:{load_spec}")
         return ReqMeta(
             req_id=tracker.req_id,
             token_len_chunk=num_tokens_to_save,
@@ -445,3 +444,4 @@ class LayerMultiBlockReqMeta:
     layer_id: int
     is_last_chunk: bool | None = True
     current_event: torch.npu.Event | None = None
+    skip_exists: bool = False

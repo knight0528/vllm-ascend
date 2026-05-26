@@ -1,11 +1,9 @@
-import logging
 import queue
 import threading
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
-
+import time
 import torch
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
@@ -70,40 +68,7 @@ class KVTransferThread(threading.Thread):
             self.finished_requests.add(req_id)
 
     def _warmup_store_connection(self):
-        """Pre-establish RDMA QP and metadata-server connections.
-
-        Every real _handle_request call does: lookup (exists) → put.
-        Both can be slow on the first call: exists needs a metadata-server
-        round-trip and put needs RDMA QP establishment.  Warm both paths
-        using real-looking keys so the first real request is fast.
-
-        Also warm each physical buffer's base address so RDMA QPs are
-        established for all registered memory regions.
-        """
-        try:
-            if not (hasattr(self, 'token_database')
-                    and self.token_database.kv_caches_base_addr):
-                return
-            addrs = self.token_database.kv_caches_base_addr
-            b_len = self.token_database.block_len
-            if not b_len:
-                return
-            size = b_len[0]
-            import time
-            ts = int(time.time())
-            # Warm each registered buffer (deduplicated by address)
-            seen = set()
-            for i, base in enumerate(addrs):
-                if base in seen:
-                    continue
-                seen.add(base)
-                warmup_key = (
-                    f"__warmup__tp{self.tp_rank}__ts{ts}__buf{i}__"
-                )
-                self.m_store.exists([warmup_key])
-                self.m_store.put([warmup_key], [[base]], [[size]])
-        except Exception:
-            pass  # best-effort
+        pass
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
@@ -119,7 +84,7 @@ class KVTransferThread(threading.Thread):
                     continue
                 self._handle_request(request_data)
             except Exception as e:
-                logger.error("Error in KVCacheTransferThread: %s", e)
+                logger.error(f"Error in KVCacheTransferThread: {e}")
 
     def _handle_request(self, req_meta: Any):
         pass
@@ -139,7 +104,7 @@ class KVTransferThread(threading.Thread):
                 exists_list[index] = value == 1
             return exists_list
         except Exception as e:
-            logger.error("Remote connection failed in contains: %s", e)
+            logger.error(f"Remote connection failed in contains: {e}")
             return [False] * len(keys)
 
     def update_kv_event(self, event: list[BlockStored]):
@@ -192,7 +157,6 @@ class KVCacheStoreSendingThread(KVTransferThread):
         token_len = req_meta.token_len_chunk
         block_ids = req_meta.block_ids
         req_id = req_meta.req_id
-        current_event = req_meta.current_event
         starts = []
         ends = []
         keys = []
@@ -229,22 +193,15 @@ class KVCacheStoreSendingThread(KVTransferThread):
         keys = [keys[index] for index in missing_indices]
         block_hashes = [block_hashes[index] for index in missing_indices]
 
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s",
-                len(keys),
-                token_len // self.block_size,
-                len(missing_indices),
-                req_id,
-            )
+        logger.debug(
+            "Storing KV cache for %d out of %d blocks (missing_count=%d) for request %s",
+            len(keys),
+            token_len // self.block_size,
+            len(missing_indices),
+            req_id,
+        )
 
         if keys:
-            """
-            Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
-            This issue will be fixed in CANN version 8.5.rc1.
-            You can manually build the master branch of the project at https://gitcode.com/cann/hixl
-            to resolve this issue before the 8.5.RC1 release.
-            """
             addrs = []
             sizes = []
             stored_events: list[BlockStored] = []
@@ -269,13 +226,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     )
                     stored_events.append(stored_event)
                     prev_key = new_block_hashes[index]
-                    logger.debug("Added kv cache event '%s' to kv cache events queue", stored_event)
+                    logger.debug(f"Added kv cache event '{stored_event}' to kv cache events queue")
 
             if self.kv_role == "kv_consumer":
                 keys, addrs, sizes = self.token_database.decode_adaptor_prefill_pp(keys, addrs, sizes)
 
-            if current_event is not None:
-                current_event.synchronize()
             self.m_store.put(keys, addrs, sizes)
 
             # TODO Query specific replica info to update the event
@@ -364,28 +319,29 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         if self.buffer_condition is None:
             return
         buf_idx = self._get_buffer_idx(layer_id)
+        fired = False
         with self.buffer_condition:
             self.buffer_pending_counts[buf_idx] -= 1
             if self.buffer_pending_counts[buf_idx] == 0:
                 self.buffer_condition.notify_all()
-                # Trigger prefetch only when buffer is fully free
-                if self.prefetch_callback is not None:
-                    self.prefetch_callback(buf_idx)
+                fired = True
+        if fired and self.prefetch_callback is not None:
+            self.prefetch_callback(buf_idx)
 
     def add_request(  # type: ignore[override]
         self, req_meta: ReqMeta
     ) -> torch.Tensor:
         self.request_queue.put(req_meta)
 
-    def _handle_request(self, req_meta: LayerMultiBlockReqMeta):
-        """Process a single layer's KV cache store request with try-finally safety."""
+    def _handle_request(  # type: ignore[override]
+        self, req_meta: LayerMultiBlockReqMeta
+    ):
         starts = req_meta.starts
         ends = req_meta.ends
         keys = req_meta.keys
         layer_id = req_meta.layer_id
-        is_last_chunk = req_meta.is_last_chunk
         total_block = len(keys)
-
+        is_last_chunk = req_meta.is_last_chunk
         if not self.dcp_size > 1:
             starts = starts[self.tp_rank % self.put_step :: self.put_step]
             ends = ends[self.tp_rank % self.put_step :: self.put_step]
@@ -398,9 +354,15 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
-        key_list = [k.to_string() for k in keys]
-        exists_states = self.lookup(key_list)
-        missing_indices = [i for i, e in enumerate(exists_states) if not e]
+        key_list = []
+        for key in keys:
+            key_list.append(key.to_string())
+
+        if req_meta.skip_exists:
+            exists_states = [False] * len(key_list)
+        else:
+            exists_states = self.lookup(key_list)
+        missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
 
         if not missing_indices:
             if is_last_chunk and layer_id == self.final_layer_id:
@@ -409,27 +371,21 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
             self.request_queue.task_done()
             return
 
-        starts = [starts[i] for i in missing_indices]
-        ends = [ends[i] for i in missing_indices]
-        key_list = [key_list[i] for i in missing_indices]
+        starts = [starts[index] for index in missing_indices]
+        ends = [ends[index] for index in missing_indices]
+        key_list = [key_list[index] for index in missing_indices]
         skip_block_num = total_block - len(key_list)
-
         try:
             addr_list = []
             size_list = []
-            for i, key in enumerate(key_list):
+            for index, key in enumerate(key_list):
                 addr, size = self.token_database.prepare_value_layer(
-                    starts[i], ends[i], req_meta.block_ids, layer_id
+                    starts[index], ends[index], req_meta.block_ids, layer_id
                 )
                 addr_list.append(addr)
                 size_list.append(size)
 
-            t0 = time.time()
             self.m_store.put(key_list, addr_list, size_list)
-            logger.info(
-                "KV send: put %.2f ms for layer %d request %s",
-                (time.time() - t0) * 1000, layer_id, req_meta.req_id[:8],
-            )
 
             if layer_id == self.final_layer_id and is_last_chunk:
                 self.set_finished_request(req_meta.req_id)
@@ -441,7 +397,6 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         finally:
             self._notify_buffer_available(layer_id)
             self.request_queue.task_done()
-
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
     def __init__(
